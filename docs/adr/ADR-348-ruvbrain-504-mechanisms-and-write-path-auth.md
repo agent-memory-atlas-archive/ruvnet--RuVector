@@ -155,7 +155,7 @@ char boundary.
 returns more than `max_bytes`, so it preserves the existing size-bound
 intention exactly and differs from the old code *only* where the old code
 panicked. The alternative — truncating to N *characters* — would change
-output length at every one of 21 sites, and nothing in the code says whether
+output length at every one of those 22 sites, and nothing in the code says whether
 those budgets are display widths or downstream field limits. A hotfix should
 not silently answer that question. Hence the name says `at_char_boundary`,
 not `_chars`.
@@ -185,8 +185,22 @@ its own evidence:
 |---|---|---|
 | `/v1/pipeline/inject/batch` | `brain-pubmed-daily` scheduler, **already sends `Authorization: Bearer`** | `AuthenticatedContributor` + write rate limit. No behaviour change for the live caller. |
 | `/v1/pipeline/inject` | `curl/7.81.0`, an ad-hoc script | `AuthenticatedContributor` + write rate limit. **Risk accepted:** whether that script sends a header is not observable from logs. It is an unauthenticated public write endpoint producing undeletable rows; the security case outweighs the chance of a 401 that is fixed by adding one header. |
+
+**Write rate limiting is an addition beyond "add authentication".** It was
+included for consistency with every sibling write route, and because an
+authenticated-but-unlimited public write endpoint is only marginally better
+than an unauthenticated one. The limit is 500 writes/hour per pseudonym
+(`rate_limit.rs`, `default_limits`), and a batch of 100 items consumes one
+token. The observed `/v1/pipeline/inject` caller runs at roughly 2/min
+(~120/hour), comfortably inside the limit, so this should not 429 it.
 | `/internal/*` (4 routes) | `ruvbrain-sse` proxy | `verify_system_key` (`BRAIN_SYSTEM_KEY`) — the mechanism `/v1/notify/digest` already uses. Proxy updated to send it. **Deploy dependency, see below.** |
 | `/internal/session/create` | as above | additionally capped at `MAX_SSE_SESSIONS = 1024` |
+
+`internal_queue_drain` returns an empty array rather than a 401 on auth
+failure, to keep its response shape. That is a **debuggability trade**: a
+misconfigured proxy polls forever seeing "nothing yet" instead of logging a
+401. Chosen because the drain loop polls every 100ms and a hard failure there
+is noisier than a quiet one; revisit if it ever masks a real outage.
 | `/v1/pipeline/pubsub` | `brain-inject-push`, OIDC as `ruvbrain-scheduler@` | **unchanged** — see below |
 | `/v1/email/inbound` | Resend webhook | **unchanged** — see below |
 | `/v1/chat/google` | Google Chat add-on | **unchanged** — see below |
@@ -200,10 +214,19 @@ dashboards that filter on the `pipeline:` prefix is not enumerable from here.
 
 > **DEPLOY DEPENDENCY — blocking.** `ruvbrain-sse` has only `BRAIN_API_URL` in
 > its environment today. It must be given `BRAIN_SYSTEM_KEY` **before or with**
-> the API deploy, or the SSE transport breaks. `verify_system_key` fails open
-> when the key is unset, so the SSE service is unaffected until it is
-> configured; the API service already has the key and will therefore start
-> enforcing immediately.
+> the API deploy, or the SSE transport breaks.
+>
+> The asymmetry matters: `verify_system_key` **fails open** when
+> `BRAIN_SYSTEM_KEY` is unset — inherited behaviour, unchanged here, but the
+> SSE deploy story now depends on it. The API service *has* the key, so it
+> starts enforcing the moment it deploys. The SSE proxy, lacking it, sends no
+> header and is rejected. The gate is therefore on the *caller's* config, not
+> the server's.
+>
+> A consequence of that same fail-open rule: in any environment where
+> `BRAIN_SYSTEM_KEY` is unset, `/internal/*` stays fully open. That is the
+> pre-existing convention for dev, not a new hole, but it means this fix is
+> only load-bearing where the secret is configured.
 
 ### P2 — decouple the CSR cache from the graph lock
 
@@ -247,15 +270,31 @@ reviewable.
 - `build_sparsifier_from(entries, n)` — an associated fn over plain data; no `self`, so no lock can be held across it; this is what runs in `spawn_blocking`
 - `install_sparsifier(&mut self, ..)` — a brief write lock
 
-The install is guarded on two failure modes that only exist because the build
-is now concurrent with mutation:
+Making the build concurrent with mutation creates failure modes that did not
+exist while it ran under a write lock. The install is guarded on all of them:
 
 - **Edges appended during the build are replayed.** `add_memory` only feeds
   the sparsifier while it is `Some`, and it is `None` for the whole build
   window, so those edges would otherwise be silently dropped.
-- **A shrinking graph aborts the install.** `remove_memory` reassigns every
-  node position, so a sparsifier built against the old indices would refer to
-  the wrong nodes. Better to have no sparsifier than a wrong one.
+- **Reassigned node positions abort the install** (`index_generation`).
+  A sparsifier is built against node *positions*. Comparing node/edge counts
+  is **not sufficient**, which was the first version of this guard and was
+  wrong: a `remove_memory` followed by any `add_memory` restores both counts
+  while every index past the removed node has shifted, and
+  `rebuild_from_batch` reassigns *every* position even for an identical
+  memory set, because it iterates a `DashMap` whose order is arbitrary.
+  `GRAPH_AUTO_REBUILD=true` in production, so that second path is live.
+  A `u64` generation counter, bumped wherever `node_index` is rebuilt rather
+  than appended to, is compared for equality on install.
+- **A shrinking graph aborts the install** — a cheap check retained on top of
+  the generation counter.
+- **An already-installed sparsifier is never overwritten.**
+  `rebuild_from_batch` is followed by an inline `rebuild_sparsifier` on the
+  small-graph path (`routes.rs`), so without this the background build could
+  clobber a freshly correct sparsifier with an older one.
+
+Better to have no sparsifier than one that silently describes the wrong graph:
+it is an analytics accelerator, and every consumer already handles `None`.
 
 The `> 5_000_000` skip is left in place. Its stated reason — a write lock held
 across the build — no longer applies, but CPU cost at that size has not been
@@ -267,9 +306,19 @@ measured, so widening the band would be a guess.
 `select_nth_unstable_by` at `offset + limit`, sorts only that prefix, and
 clones only the returned rows.
 
-Ordering is unchanged except for being *more* deterministic: equal sort keys
-were previously ordered by `DashMap` iteration order, which can differ between
-two identical requests. They now tie-break on id.
+Ordering changes in two ways, both deliberate:
+
+- **`UpdatedAt` now compares microseconds, not nanoseconds.** The key is an
+  `f64` (exactly representable at microsecond resolution for any plausible
+  timestamp); the previous comparator used `DateTime::cmp`, i.e. nanoseconds.
+  Rows written within the same microsecond now tie-break on id rather than on
+  sub-microsecond time.
+- **Ties are now deterministic.** Equal sort keys were previously ordered by
+  `DashMap` iteration order, which can differ between two identical requests.
+
+The equivalence test uses the *new* key in its reference implementation, so it
+proves the partition-and-paginate logic is correct — it does **not** prove
+byte-for-byte equivalence with the old nanosecond ordering.
 
 ## Deliberately not decided here
 
@@ -287,9 +336,14 @@ next reader the endpoint is protected.
 The live `brain-inject-push` subscription *does* attach an OIDC token for
 `ruvbrain-scheduler@ruv-dev.iam.gserviceaccount.com`. The fix is to verify it
 in-handler (issuer, signature against Google's JWKS, and the expected service
-account). Not done here: it needs a new dependency, a decision on the expected
-audience value, and it cannot be exercised against a real token from a unit
-test.
+account). Not done here: it needs a new dependency and cannot be exercised against a
+real token from a unit test.
+
+The audience is no longer an unknown — `brain-inject-push` sets no explicit
+`audience`, which means Google signs the token with the push endpoint URL
+(`https://pi.ruv.io/v1/pipeline/pubsub`) as the audience. So a future
+implementation should expect exactly that, with
+`ruvbrain-scheduler@ruv-dev.iam.gserviceaccount.com` as the verified email.
 
 Note that `AuthenticatedContributor` is the **wrong** mechanism here: a Google
 OIDC JWT is far longer than the extractor's 256-byte ceiling, so applying it
@@ -350,7 +404,8 @@ from the code. Anything phrased as a speedup would be invented.
 Baseline before any edit, so pre-existing and introduced failures could not be
 confused: `cargo fmt --check` clean, 146 tests passing,
 `cargo clippy --all-targets --all-features -- -D warnings` clean. After:
-**163 tests passing**, fmt and clippy still clean.
+**166 unit tests plus 1 doctest passing**, fmt and clippy still clean on the
+final commit.
 
 Every new test was confirmed to **fail** against the code it protects:
 
@@ -360,7 +415,9 @@ Every new test was confirmed to **fail** against the code it protects:
 | digest rows survive multibyte titles | reverting `format_digest_rows` to byte slicing → both tests panic |
 | `ranked_search` under concurrent read locks | reverting to `&mut self` → **fails to compile** (`cannot borrow ... as mutable`) |
 | pipeline rows deletable by system | removing the `system \|\|` clause → fails |
-| sparsifier install guard / replay | removing each → the corresponding test fails |
+| sparsifier edge replay | removing the replay loop → test fails |
+| sparsifier shrink guard | removing it → test fails |
+| sparsifier `index_generation` guard | removing it → the remove-plus-add and `rebuild_from_batch` tests fail, while the shrink and overwrite tests still pass (they are covered by the other guards) |
 | `list_memories` pagination | off-by-one in the partition point → fails |
 
 The `ranked_search` case is worth calling out: it is enforced by the type

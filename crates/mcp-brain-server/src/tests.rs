@@ -1063,7 +1063,7 @@ mod tests {
     #[test]
     fn sparsifier_builds_from_a_snapshot_with_no_graph_borrowed() {
         let g = graph_with_memories(40);
-        let (entries, nodes, edges) = g
+        let (entries, nodes, edges, gen) = g
             .sparsifier_snapshot()
             .expect("graph should yield a snapshot");
         assert!(edges > 0 && nodes == 40);
@@ -1075,7 +1075,7 @@ mod tests {
         let mut g = g;
         if let Some(spar) = built {
             assert!(
-                g.install_sparsifier(spar, nodes, edges),
+                g.install_sparsifier(spar, nodes, edges, gen),
                 "install should succeed when the graph is unchanged"
             );
             assert!(g.sparsifier_stats().is_some());
@@ -1087,7 +1087,7 @@ mod tests {
     #[test]
     fn install_replays_edges_added_during_the_build() {
         let mut g = graph_with_memories(40);
-        let (entries, nodes, edges) = g.sparsifier_snapshot().unwrap();
+        let (entries, nodes, edges, gen) = g.sparsifier_snapshot().unwrap();
         let built = crate::graph::KnowledgeGraph::build_sparsifier_from(&entries, nodes);
 
         // Simulate an inject landing mid-build.
@@ -1102,7 +1102,7 @@ mod tests {
 
         if let Some(spar) = built {
             assert!(
-                g.install_sparsifier(spar, nodes, edges),
+                g.install_sparsifier(spar, nodes, edges, gen),
                 "install should still succeed after a concurrent append"
             );
             let stats = g.sparsifier_stats().expect("stats after install");
@@ -1120,7 +1120,7 @@ mod tests {
     #[test]
     fn install_refuses_when_the_graph_shrank_during_the_build() {
         let mut g = graph_with_memories(40);
-        let (entries, nodes, edges) = g.sparsifier_snapshot().unwrap();
+        let (entries, nodes, edges, gen) = g.sparsifier_snapshot().unwrap();
         let built = crate::graph::KnowledgeGraph::build_sparsifier_from(&entries, nodes);
 
         // Simulate a delete landing mid-build. remove_memory reindexes every
@@ -1131,7 +1131,7 @@ mod tests {
 
         if let Some(spar) = built {
             assert!(
-                !g.install_sparsifier(spar, nodes, edges),
+                !g.install_sparsifier(spar, nodes, edges, gen),
                 "install must refuse a sparsifier built against stale indices"
             );
             assert!(
@@ -1268,6 +1268,105 @@ mod tests {
             assert_eq!(
                 again, first,
                 "identical requests must return identical pages"
+            );
+        }
+    }
+
+    /// The count check alone is NOT sufficient. A remove followed by an add
+    /// restores both counts while `remove_memory` has shifted every node
+    /// position past the removed one — so a sparsifier built before the pair
+    /// describes the wrong nodes at the same cardinality. Only the
+    /// `index_generation` check catches this.
+    #[test]
+    fn install_refuses_after_a_remove_and_add_that_restores_the_counts() {
+        let mut g = graph_with_memories(40);
+        let (entries, nodes, edges, gen) = g.sparsifier_snapshot().unwrap();
+        let built = crate::graph::KnowledgeGraph::build_sparsifier_from(&entries, nodes);
+
+        // Remove one node (reindexes everything after it) ...
+        let victim = g.node_ids_snapshot()[5];
+        g.remove_memory(&victim);
+        // ... then add one back, restoring node_count and pushing edges back up.
+        for i in 0..3 {
+            let mut m = memory_with(&format!("replacement {i}"), "content");
+            let mut e = vec![0.9f32; 8];
+            e[i % 8] += 0.3;
+            crate::graph::normalize_embedding(&mut e);
+            m.embedding = e;
+            g.add_memory(&m);
+        }
+
+        assert!(
+            g.node_count() >= nodes && g.edge_count() >= edges,
+            "precondition: the counts must be restored, so only the generation \
+             check can reject this build (nodes {} vs {}, edges {} vs {})",
+            g.node_count(),
+            nodes,
+            g.edge_count(),
+            edges
+        );
+
+        if let Some(spar) = built {
+            assert!(
+                !g.install_sparsifier(spar, nodes, edges, gen),
+                "install must refuse after node positions were reassigned, even \
+                 though the counts recovered"
+            );
+            assert!(g.sparsifier_stats().is_none());
+        }
+    }
+
+    /// `rebuild_from_batch` reassigns every node position even for an
+    /// identical memory set (it walks a DashMap, whose order is arbitrary), so
+    /// a build that started before it must also be refused.
+    #[test]
+    fn install_refuses_after_a_full_rebuild_from_batch() {
+        let mut g = graph_with_memories(30);
+        let (entries, nodes, edges, gen) = g.sparsifier_snapshot().unwrap();
+        let built = crate::graph::KnowledgeGraph::build_sparsifier_from(&entries, nodes);
+
+        let memories: Vec<_> = (0..30)
+            .map(|i| {
+                let mut m = memory_with(&format!("mem {i}"), "content");
+                let mut e = vec![0.9f32; 8];
+                e[i % 8] += 0.3;
+                crate::graph::normalize_embedding(&mut e);
+                m.embedding = e;
+                m
+            })
+            .collect();
+        g.rebuild_from_batch(&memories);
+
+        if let Some(spar) = built {
+            assert!(
+                !g.install_sparsifier(spar, nodes, edges, gen),
+                "install must refuse after rebuild_from_batch reassigned positions"
+            );
+        }
+    }
+
+    /// A sparsifier installed by another path while this build ran must not be
+    /// clobbered by the older background build.
+    #[test]
+    fn install_refuses_to_overwrite_a_newer_sparsifier() {
+        let mut g = graph_with_memories(30);
+        let (entries, nodes, edges, gen) = g.sparsifier_snapshot().unwrap();
+        let built = crate::graph::KnowledgeGraph::build_sparsifier_from(&entries, nodes);
+
+        // The inline small-graph path (routes.rs) builds one directly.
+        g.rebuild_sparsifier();
+        if g.sparsifier_stats().is_none() {
+            return; // sparsifier unavailable in this environment; nothing to assert
+        }
+
+        if let Some(spar) = built {
+            assert!(
+                !g.install_sparsifier(spar, nodes, edges, gen),
+                "install must not overwrite a sparsifier built while this one ran"
+            );
+            assert!(
+                g.sparsifier_stats().is_some(),
+                "the newer sparsifier must survive the refused install"
             );
         }
     }

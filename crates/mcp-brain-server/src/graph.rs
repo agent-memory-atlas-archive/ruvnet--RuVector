@@ -42,6 +42,15 @@ pub struct KnowledgeGraph {
     csr_build: parking_lot::Mutex<()>,
     /// Spectral sparsifier for compressed graph analytics (ADR-116)
     sparsifier: Option<AdaptiveGeoSpar>,
+    /// Bumped every time `node_index` is REASSIGNED rather than appended to.
+    ///
+    /// A sparsifier is built against node *positions*, so any reshuffle
+    /// invalidates one that is mid-build. Comparing counts is not enough:
+    /// a remove plus an add restores the counts while shifting every index
+    /// after the removed node, and `rebuild_from_batch` reassigns every
+    /// position even when the memory set is identical (it iterates a DashMap,
+    /// whose order is arbitrary).
+    index_generation: u64,
 }
 
 struct GraphNode {
@@ -71,6 +80,7 @@ impl KnowledgeGraph {
             csr_dirty: AtomicBool::new(false),
             csr_build: parking_lot::Mutex::new(()),
             sparsifier: None,
+            index_generation: 0,
         }
     }
 
@@ -92,6 +102,8 @@ impl KnowledgeGraph {
         self.mark_csr_dirty();
         self.mincut = None;
         self.sparsifier = None;
+        // Every node position is about to be reassigned.
+        self.index_generation = self.index_generation.wrapping_add(1);
 
         let n = memories.len();
         if n == 0 {
@@ -275,6 +287,8 @@ impl KnowledgeGraph {
         self.mincut = None;
         *self.csr_cache.write() = None;
         self.csr_dirty.store(false, Ordering::Release);
+        // Positions after the removed node have all shifted.
+        self.index_generation = self.index_generation.wrapping_add(1);
         // Sparsifier indices are now stale after compaction — rebuild lazily
         self.sparsifier = None;
     }
@@ -877,9 +891,9 @@ impl KnowledgeGraph {
     ///
     /// Returned under a *read* lock and then used with no lock held at all,
     /// so the expensive `AdaptiveGeoSpar::build` no longer runs inside
-    /// `graph.write()`. Returns `(coo_entries, node_count, edge_count)`;
-    /// the two counts are the guard values for `install_sparsifier`.
-    pub fn sparsifier_snapshot(&self) -> Option<(Vec<(usize, usize, f64)>, usize, usize)> {
+    /// `graph.write()`. Returns `(coo_entries, node_count, edge_count, index_generation)`;
+    /// the last three are the guard values for `install_sparsifier`.
+    pub fn sparsifier_snapshot(&self) -> Option<(Vec<(usize, usize, f64)>, usize, usize, u64)> {
         if self.node_ids.is_empty() || self.edges.is_empty() {
             return None;
         }
@@ -892,7 +906,12 @@ impl KnowledgeGraph {
                 Some((u, v, e.weight))
             })
             .collect();
-        Some((entries, self.node_ids.len(), self.edges.len()))
+        Some((
+            entries,
+            self.node_ids.len(),
+            self.edges.len(),
+            self.index_generation,
+        ))
     }
 
     /// Build a sparsifier from a snapshot. Pure — holds no lock, touches no
@@ -919,9 +938,19 @@ impl KnowledgeGraph {
 
     /// Install a sparsifier built from a snapshot, under a brief write lock.
     ///
-    /// Refuses the install if the graph shrank while the build ran: node
-    /// positions are reassigned by `remove_memory`, so a sparsifier built
-    /// against the old indices would silently refer to the wrong nodes.
+    /// Refuses the install in three cases, each of which would otherwise
+    /// leave a sparsifier that silently describes the wrong graph:
+    ///
+    /// 1. **Node positions were reassigned** (`index_generation` changed).
+    ///    Counts alone do not catch this — a remove plus an add restores them
+    ///    while shifting every index past the removed node, and
+    ///    `rebuild_from_batch` reassigns all of them even for an identical
+    ///    memory set.
+    /// 2. **The graph shrank**, a cheap belt-and-braces check on top of (1).
+    /// 3. **Someone already installed a sparsifier** while this build ran —
+    ///    `rebuild_from_batch` is followed by an inline `rebuild_sparsifier`
+    ///    on the small-graph path, and overwriting that fresh one with this
+    ///    older build would be a regression.
     ///
     /// Edges appended during the build are replayed, because `add_memory`
     /// only feeds the sparsifier while it is `Some` — and it was `None` for
@@ -933,7 +962,17 @@ impl KnowledgeGraph {
         spar: AdaptiveGeoSpar,
         snapshot_nodes: usize,
         snapshot_edges: usize,
+        snapshot_generation: u64,
     ) -> bool {
+        if self.index_generation != snapshot_generation {
+            tracing::warn!(
+                "Discarding sparsifier build: node positions were reassigned \
+                 during build (generation {} -> {})",
+                snapshot_generation,
+                self.index_generation
+            );
+            return false;
+        }
         if self.node_ids.len() < snapshot_nodes || self.edges.len() < snapshot_edges {
             tracing::warn!(
                 "Discarding sparsifier build: graph shrank during build \
@@ -942,6 +981,13 @@ impl KnowledgeGraph {
                 self.node_ids.len(),
                 snapshot_edges,
                 self.edges.len()
+            );
+            return false;
+        }
+        if self.sparsifier.is_some() {
+            tracing::info!(
+                "Discarding sparsifier build: a newer sparsifier was installed \
+                 while this one was building"
             );
             return false;
         }

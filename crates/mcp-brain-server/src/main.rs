@@ -204,7 +204,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!("Background sparsifier build starting ({edge_count} edges)");
 
             let snapshot = spar_state.graph.read().sparsifier_snapshot();
-            let Some((entries, snap_nodes, snap_edges)) = snapshot else {
+            let Some((entries, snap_nodes, snap_edges, snap_gen)) = snapshot else {
                 tracing::info!("Sparsifier build skipped: empty graph snapshot");
                 return;
             };
@@ -223,7 +223,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let installed = spar_state
                         .graph
                         .write()
-                        .install_sparsifier(spar, snap_nodes, snap_edges);
+                        .install_sparsifier(spar, snap_nodes, snap_edges, snap_gen);
                     if !installed {
                         tracing::warn!("Sparsifier build discarded (graph changed during build)");
                     }
