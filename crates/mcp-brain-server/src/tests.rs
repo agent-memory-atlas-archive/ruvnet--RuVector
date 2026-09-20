@@ -802,4 +802,77 @@ mod tests {
         let bad_score = crate::midstream::solver_confidence_score(&bad_cert);
         assert_eq!(bad_score, 0.0, "gate_pass=false should give zero score");
     }
+
+    // -----------------------------------------------------------------------
+    // Digest rendering: UTF-8 boundary regression (the panic that took down
+    // the production `ruvbrain` service — routes.rs `notify_digest`)
+    // -----------------------------------------------------------------------
+
+    fn memory_with(title: &str, content: &str) -> crate::types::BrainMemory {
+        crate::types::BrainMemory {
+            id: uuid::Uuid::new_v4(),
+            category: crate::types::BrainCategory::Pattern,
+            title: title.to_string(),
+            content: content.to_string(),
+            tags: vec!["demo".to_string()],
+            code_snippet: None,
+            embedding: vec![0.0; 8],
+            contributor_id: "test".to_string(),
+            quality_score: crate::types::BetaParams::new(),
+            partition_id: None,
+            witness_hash: String::new(),
+            rvf_gcs_path: None,
+            redaction_log: None,
+            dp_proof: None,
+            witness_chain: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Titles/contents whose byte budget (120 for title, 250 for content)
+    /// lands strictly inside a multi-byte character. Before the fix,
+    /// `&m.title[..120]` / `&m.content[..250]` panicked with
+    /// "byte index N is not a char boundary", aborting the request task.
+    #[test]
+    fn digest_rows_survive_multibyte_titles_at_the_truncation_boundary() {
+        let cases = vec![
+            // 2-byte char straddling the 120-byte title budget
+            memory_with(&format!("{}é tail", "a".repeat(119)), "short"),
+            // 3-byte CJK straddling the title budget
+            memory_with(&format!("{}中文", "a".repeat(119)), "short"),
+            // 4-byte emoji straddling the title budget (starts at byte 118)
+            memory_with(&format!("{}😀 more", "a".repeat(118)), "short"),
+            // 4-byte emoji straddling the 250-byte content budget
+            memory_with("ok", &format!("{}😀 rest of the content", "b".repeat(248))),
+            // 3-byte CJK straddling the content budget
+            memory_with("ok", &format!("{}中文内容", "b".repeat(249))),
+        ];
+
+        for m in &cases {
+            let rows = crate::routes::format_digest_rows(std::slice::from_ref(m));
+            assert!(
+                rows.contains("<tr"),
+                "expected a rendered row for title {:?}",
+                m.title
+            );
+        }
+
+        // Rendering them all together also works and yields one row each.
+        let rows = crate::routes::format_digest_rows(&cases);
+        assert_eq!(rows.matches("<tr").count(), cases.len());
+    }
+
+    /// The truncation must actually bound the output, not just avoid panicking.
+    #[test]
+    fn digest_rows_truncate_long_multibyte_fields() {
+        // 200 emoji = 800 bytes of title; must be cut to <= 120 bytes.
+        let m = memory_with(&"😀".repeat(200), &"中".repeat(400));
+        let rows = crate::routes::format_digest_rows(std::slice::from_ref(&m));
+
+        // 120 bytes / 4 bytes-per-emoji = exactly 30 emoji survive.
+        assert_eq!(rows.matches('😀').count(), 30);
+        // 250 bytes / 3 bytes-per-CJK = 83 chars (249 bytes), floor to boundary.
+        assert_eq!(rows.matches('中').count(), 83);
+    }
 }

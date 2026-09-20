@@ -2,6 +2,7 @@
 
 use crate::auth::AuthenticatedContributor;
 use crate::graph::cosine_similarity;
+use crate::text::truncate_at_char_boundary;
 use crate::types::{
     AddEvidenceRequest, AppState, BatchInjectRequest, BatchInjectResponse, BetaParams, BrainMemory,
     ChallengeResponse, ConsciousnessComputeRequest, ConsciousnessComputeResponse,
@@ -1150,10 +1151,11 @@ pub fn run_enhanced_training_cycle(state: &AppState, force_full: bool) -> Enhanc
     for mem in discovery_memories.iter().take(5) {
         // Truncate content to first meaningful sentence
         let content = &mem.content;
-        let finding = if let Some(pos) = content[..content.len().min(300)].find(". ") {
+        let head = truncate_at_char_boundary(content, 300);
+        let finding = if let Some(pos) = head.find(". ") {
             &content[..pos + 1]
         } else {
-            &content[..content.len().min(200)]
+            truncate_at_char_boundary(content, 200)
         };
         findings.push(format!("{}: {}", mem.title, finding));
     }
@@ -1201,11 +1203,7 @@ pub fn run_enhanced_training_cycle(state: &AppState, force_full: bool) -> Enhanc
     let discovery_title = if !raw_inferences.is_empty() {
         // Use first inference as the basis for the title
         let first = &raw_inferences[0];
-        let short = if first.len() > 80 {
-            &first[..80]
-        } else {
-            first
-        };
+        let short = truncate_at_char_boundary(first, 80);
         format!("Discovery: {}", short)
     } else if curiosity_triggered {
         "Curiosity-Driven Knowledge Gap Analysis".to_string()
@@ -6859,6 +6857,72 @@ async fn notify_help(
     }
 }
 
+/// Render the per-memory `<tr>` rows of the daily digest email.
+///
+/// Extracted from `notify_digest` so the truncation behaviour that panicked
+/// production (byte-slicing `title`/`content` at a fixed budget) is directly
+/// testable without an `AppState`, a notifier, or a live Resend key.
+pub fn format_digest_rows<M: std::borrow::Borrow<crate::types::BrainMemory>>(
+    memories: &[M],
+) -> String {
+    fn category_emoji(cat: &crate::types::BrainCategory) -> &'static str {
+        use crate::types::BrainCategory::*;
+        match cat {
+            Architecture => "🏗️",
+            Pattern => "🔄",
+            Solution => "💡",
+            Security => "🔒",
+            Convention => "📐",
+            Performance => "⚡",
+            Tooling => "🔧",
+            Debug => "🐛",
+            _ => "📝",
+        }
+    }
+
+    let mut rows = String::new();
+    for m in memories {
+        let m = m.borrow();
+        let title = truncate_at_char_boundary(&m.title, 120);
+        // Take first ~250 bytes but break at sentence boundary
+        let content_raw = truncate_at_char_boundary(&m.content, 250);
+        let content = match content_raw.rfind(". ") {
+            Some(pos) if pos > 80 => &content_raw[..pos + 1],
+            _ => content_raw,
+        };
+        let emoji = category_emoji(&m.category);
+        let tags_html: Vec<_> = m
+            .tags
+            .iter()
+            .filter(|t| !t.contains("auto-generated") && !t.contains("training-cycle"))
+            .take(3)
+            .map(|t| {
+                format!("<span style=\"display:inline-block;background:#1a1a3a;color:#4fc3f7;padding:2px 8px;border-radius:4px;font-size:11px;margin:2px;\">{}</span>", t)
+            })
+            .collect();
+        rows.push_str(&format!(
+            r#"<tr style="border-bottom:1px solid #1a1a3a;">
+<td style="padding:14px 0;">
+<div style="margin-bottom:4px;">{emoji} <strong style="color:#e0e0ff;font-size:14px;">{title}</strong></div>
+<div style="margin-bottom:6px;">{tags}</div>
+<div style="color:#aaa;font-size:12px;line-height:1.5;">{content}</div>
+</td></tr>"#,
+            emoji = emoji,
+            title = title,
+            tags = if tags_html.is_empty() {
+                format!(
+                    "<span style=\"color:#666;font-size:11px;\">{:?}</span>",
+                    m.category
+                )
+            } else {
+                tags_html.join("")
+            },
+            content = content,
+        ));
+    }
+    rows
+}
+
 /// POST /v1/notify/digest — send daily discovery digest email
 /// Triggered by Cloud Scheduler after research jobs complete.
 /// Body: { "topic": "optional focus topic", "limit": 10, "hours": 24 }
@@ -6949,62 +7013,7 @@ async fn notify_digest(
     }
 
     // Build HTML rows — human-readable format
-    let mut rows = String::new();
-    let category_emoji = |cat: &crate::types::BrainCategory| -> &str {
-        use crate::types::BrainCategory::*;
-        match cat {
-            Architecture => "🏗️",
-            Pattern => "🔄",
-            Solution => "💡",
-            Security => "🔒",
-            Convention => "📐",
-            Performance => "⚡",
-            Tooling => "🔧",
-            Debug => "🐛",
-            _ => "📝",
-        }
-    };
-
-    for (i, m) in filtered.iter().enumerate() {
-        let title = if m.title.len() > 120 {
-            &m.title[..120]
-        } else {
-            &m.title
-        };
-        // Take first ~250 chars but break at sentence boundary
-        let content_raw = if m.content.len() > 250 {
-            &m.content[..250]
-        } else {
-            &m.content
-        };
-        let content = match content_raw.rfind(". ") {
-            Some(pos) if pos > 80 => &content_raw[..pos + 1],
-            _ => content_raw,
-        };
-        let emoji = category_emoji(&m.category);
-        let tags_html: Vec<_> = m.tags.iter()
-            .filter(|t| !t.contains("auto-generated") && !t.contains("training-cycle"))
-            .take(3)
-            .map(|t| {
-                format!("<span style=\"display:inline-block;background:#1a1a3a;color:#4fc3f7;padding:2px 8px;border-radius:4px;font-size:11px;margin:2px;\">{}</span>", t)
-            }).collect();
-        rows.push_str(&format!(
-            r#"<tr style="border-bottom:1px solid #1a1a3a;">
-<td style="padding:14px 0;">
-<div style="margin-bottom:4px;">{emoji} <strong style="color:#e0e0ff;font-size:14px;">{title}</strong></div>
-<div style="margin-bottom:6px;">{tags}</div>
-<div style="color:#aaa;font-size:12px;line-height:1.5;">{content}</div>
-</td></tr>"#,
-            emoji = emoji,
-            title = title,
-            tags = if tags_html.is_empty() {
-                format!("<span style=\"color:#666;font-size:11px;\">{:?}</span>", m.category)
-            } else {
-                tags_html.join("")
-            },
-            content = content,
-        ));
-    }
+    let rows = format_digest_rows(&filtered);
 
     let topic_line = topic.map_or(String::new(), |t| {
         format!("<p style=\"color:#888;font-size:12px;\">Focus: <span style=\"background:#1a1a3a;color:#7fdbca;padding:2px 6px;border-radius:4px;\">{}</span></p>", t)
@@ -7332,7 +7341,7 @@ async fn google_chat_handler(
     tracing::info!(
         "Google Chat raw payload ({} bytes): {}...",
         body.len(),
-        &raw_str[..raw_str.len().min(300)]
+        truncate_at_char_boundary(&raw_str, 300)
     );
 
     // Parse as generic JSON first to handle both Add-on and legacy formats
@@ -7342,7 +7351,7 @@ async fn google_chat_handler(
             tracing::warn!(
                 "Failed to parse Chat JSON: {}. Raw: {}...",
                 err,
-                &raw_str[..raw_str.len().min(300)]
+                truncate_at_char_boundary(&raw_str, 300)
             );
             return Json(chat_card(
                 "Error",
@@ -7548,11 +7557,7 @@ async fn google_chat_handler(
 
             let mut result_text = String::new();
             for (i, (title, content, cat, score)) in top.iter().enumerate() {
-                let truncated = if content.len() > 150 {
-                    &content[..150]
-                } else {
-                    content.as_str()
-                };
+                let truncated = truncate_at_char_boundary(content, 150);
                 result_text.push_str(&format!(
                     "<b>{}.</b> {} <i>({})</i>\n{}\n<font color=\"#888888\">score: {:.3}</font>\n\n",
                     i + 1, title, cat, truncated, score
@@ -7623,11 +7628,7 @@ async fn google_chat_handler(
 
             let mut text = String::new();
             for (i, m) in recent.iter().enumerate() {
-                let truncated = if m.content.len() > 100 {
-                    &m.content[..100]
-                } else {
-                    &m.content
-                };
+                let truncated = truncate_at_char_boundary(&m.content, 100);
                 text.push_str(&format!(
                     "<b>{}.</b> {} <i>({})</i>\n{}\n\n",
                     i + 1,
@@ -7671,7 +7672,7 @@ async fn google_chat_handler(
             match gemini_chat_respond(&state, text, user_name).await {
                 Ok(response) => Json(chat_card(
                     "Pi Brain",
-                    &format!("Re: {}", &text[..text.len().min(30)]),
+                    &format!("Re: {}", truncate_at_char_boundary(text, 30)),
                     vec![chat_text_section(&response)],
                 )),
                 Err(e) => {
@@ -7703,11 +7704,7 @@ async fn google_chat_handler(
 
                     let mut result_text = format!("Results for \"<i>{}</i>\":\n\n", query);
                     for (i, (title, content, cat, _score)) in top.iter().enumerate() {
-                        let truncated = if content.len() > 120 {
-                            &content[..120]
-                        } else {
-                            content.as_str()
-                        };
+                        let truncated = truncate_at_char_boundary(content, 120);
                         result_text.push_str(&format!(
                             "<b>{}.</b> {} <i>({})</i>\n{}\n\n",
                             i + 1,
@@ -7767,7 +7764,7 @@ async fn gemini_chat_respond(
         "No relevant memories found for this query.".to_string()
     } else {
         top_results.iter().enumerate().map(|(i, (m, score))| {
-            let content_preview = if m.content.len() > 600 { &m.content[..600] } else { &m.content };
+            let content_preview = truncate_at_char_boundary(&m.content, 600);
             let tags = m.tags.iter().take(5).map(|t| t.as_str()).collect::<Vec<_>>().join(", ");
             format!("MEMORY {}: [category: {}] [tags: {}] [relevance: {:.0}%]\nTitle: {}\nContent: {}\n",
                 i + 1, m.category, tags, score * 100.0, m.title, content_preview)
@@ -7781,11 +7778,7 @@ async fn gemini_chat_respond(
         .iter()
         .take(5)
         .map(|m| {
-            let preview = if m.content.len() > 150 {
-                &m.content[..150]
-            } else {
-                &m.content
-            };
+            let preview = truncate_at_char_boundary(&m.content, 150);
             format!("- <b>{}</b> [{}]: {}", m.title, m.category, preview)
         })
         .collect();
@@ -7873,7 +7866,7 @@ You are chatting with {user} in Google Chat. Your role:
         return Err(format!(
             "Gemini API {}: {}",
             status,
-            &text[..text.len().min(200)]
+            truncate_at_char_boundary(&text, 200)
         ));
     }
 
@@ -7904,7 +7897,7 @@ You are chatting with {user} in Google Chat. Your role:
     let truncated = if html.len() > 3000 {
         format!(
             "{}…\n\n<i>See more at <a href=\"https://pi.ruv.io\">pi.ruv.io</a></i>",
-            &html[..3000]
+            truncate_at_char_boundary(&html, 3000)
         )
     } else {
         html
