@@ -735,10 +735,27 @@ impl FirestoreClient {
     /// Delete a memory (contributor-scoped, cache + Firestore)
     /// Uses atomic remove_if to prevent TOCTOU race
     pub async fn delete_memory(&self, id: &Uuid, contributor: &str) -> Result<bool, StoreError> {
+        self.delete_memory_as(id, contributor, false).await
+    }
+
+    /// Delete a memory, optionally as a system operator.
+    ///
+    /// Contributor-scoped deletes can only ever remove rows whose
+    /// `contributor_id` equals the caller's pseudonym. Pipeline injections are
+    /// stored under a synthetic `pipeline:{source}` owner that no pseudonym can
+    /// ever equal, so before this override existed they could not be removed
+    /// through the API at all. `system = true` (a `BRAIN_SYSTEM_KEY` holder)
+    /// bypasses the ownership check so an operator can clean them up.
+    pub async fn delete_memory_as(
+        &self,
+        id: &Uuid,
+        contributor: &str,
+        system: bool,
+    ) -> Result<bool, StoreError> {
         // Atomic check-and-remove: no TOCTOU window
         let removed = self
             .memories
-            .remove_if(id, |_, entry| entry.contributor_id == contributor);
+            .remove_if(id, |_, entry| system || entry.contributor_id == contributor);
         match removed {
             Some(_) => {
                 self.firestore_delete("brain_memories", &id.to_string())

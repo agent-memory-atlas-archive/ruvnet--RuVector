@@ -875,4 +875,72 @@ mod tests {
         // 250 bytes / 3 bytes-per-CJK = 83 chars (249 bytes), floor to boundary.
         assert_eq!(rows.matches('中').count(), 83);
     }
+
+    // -----------------------------------------------------------------------
+    // P1: pipeline injections must be removable by a system operator.
+    //
+    // `process_inject` stores `contributor_id = "pipeline:{source}"`, a value
+    // no contributor pseudonym can ever equal (pseudonyms are 32 hex chars),
+    // so the contributor-scoped delete could never remove an injected row.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn pipeline_rows_are_undeletable_by_a_contributor_but_deletable_by_system() {
+        let store = crate::store::FirestoreClient::new();
+
+        let mut m = memory_with("injected", "body");
+        // Exactly what process_inject writes for an inject with source="pubmed".
+        m.contributor_id = "pipeline:pubmed".to_string();
+        let id = m.id;
+        store.store_memory(m).await.expect("store_memory");
+
+        // A real contributor pseudonym — 32 hex chars, never equal to
+        // "pipeline:...". The contributor-scoped delete must refuse.
+        let pseudonym = "0123456789abcdef0123456789abcdef";
+        let err = store.delete_memory(&id, pseudonym).await;
+        assert!(
+            matches!(err, Err(crate::store::StoreError::Forbidden(_))),
+            "contributor-scoped delete of a pipeline row should be Forbidden, got {err:?}"
+        );
+        assert!(
+            store.get_memory(&id).await.unwrap().is_some(),
+            "row must still be present after the refused delete"
+        );
+
+        // A BRAIN_SYSTEM_KEY holder can clean it up.
+        let deleted = store
+            .delete_memory_as(&id, "ruvector-seed", true)
+            .await
+            .expect("system delete should not error");
+        assert!(deleted, "system delete should report success");
+        assert!(
+            store.get_memory(&id).await.unwrap().is_none(),
+            "row must be gone after the system delete"
+        );
+    }
+
+    /// The system override must not turn every delete into a system delete:
+    /// a non-system caller still cannot touch another contributor's row.
+    #[tokio::test]
+    async fn system_override_does_not_leak_to_ordinary_contributors() {
+        let store = crate::store::FirestoreClient::new();
+        let mut m = memory_with("someone elses", "body");
+        m.contributor_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let id = m.id;
+        store.store_memory(m).await.expect("store_memory");
+
+        let other = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        assert!(matches!(
+            store.delete_memory_as(&id, other, false).await,
+            Err(crate::store::StoreError::Forbidden(_))
+        ));
+        assert!(store.get_memory(&id).await.unwrap().is_some());
+
+        // The owner can still delete their own row.
+        let deleted = store
+            .delete_memory_as(&id, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false)
+            .await
+            .expect("owner delete should not error");
+        assert!(deleted);
+    }
 }

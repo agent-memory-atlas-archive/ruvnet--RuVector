@@ -2418,7 +2418,7 @@ async fn delete_memory(
 
     let deleted = state
         .store
-        .delete_memory(&id, &contributor.pseudonym)
+        .delete_memory_as(&id, &contributor.pseudonym, contributor.is_system)
         .await
         .map_err(|e| match e {
             crate::store::StoreError::Forbidden(_) => (StatusCode::FORBIDDEN, e.to_string()),
@@ -3799,11 +3799,24 @@ async fn process_inject(state: &AppState, req: InjectRequest) -> Result<InjectRe
 }
 
 /// POST /v1/pipeline/inject — inject a single item into the brain pipeline
+///
+/// Requires a contributor API key. Before this extractor was added the
+/// endpoint was writable by anyone on the internet: the Cloud Run service
+/// grants `roles/run.invoker` to `allUsers`, and `READ_ONLY` is unset in
+/// production, so `check_read_only` alone gated nothing.
 async fn pipeline_inject(
     State(state): State<AppState>,
+    contributor: AuthenticatedContributor,
     Json(req): Json<InjectRequest>,
 ) -> Result<(StatusCode, Json<InjectResponse>), (StatusCode, String)> {
     check_read_only(&state)?;
+
+    if !state.rate_limiter.check_write(&contributor.pseudonym) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "Write rate limit exceeded".into(),
+        ));
+    }
 
     match process_inject(&state, req).await {
         Ok(resp) => Ok((StatusCode::CREATED, Json(resp))),
@@ -3818,11 +3831,23 @@ async fn pipeline_inject(
 }
 
 /// POST /v1/pipeline/inject/batch — inject up to 100 items
+///
+/// Requires a contributor API key (see `pipeline_inject`). The live
+/// `brain-pubmed-daily` Cloud Scheduler job already sends a Bearer token to
+/// this path, so adding the extractor does not change its behaviour.
 async fn pipeline_inject_batch(
     State(state): State<AppState>,
+    contributor: AuthenticatedContributor,
     Json(req): Json<BatchInjectRequest>,
 ) -> Result<Json<BatchInjectResponse>, (StatusCode, String)> {
     check_read_only(&state)?;
+
+    if !state.rate_limiter.check_write(&contributor.pseudonym) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "Write rate limit exceeded".into(),
+        ));
+    }
 
     if req.items.len() > 100 {
         return Err((
@@ -3872,7 +3897,26 @@ async fn pipeline_inject_batch(
 }
 
 /// POST /v1/pipeline/pubsub — receive Cloud Pub/Sub push messages.
-/// No Bearer auth required (Cloud Run validates Pub/Sub OIDC tokens automatically).
+///
+/// # UNAUTHENTICATED — do not trust the previous comment here
+///
+/// This used to claim "Cloud Run validates Pub/Sub OIDC tokens
+/// automatically". That is **false for this service**. Cloud Run only
+/// validates the OIDC token when the service *requires* authentication;
+/// `ruvbrain` grants `roles/run.invoker` to `allUsers` (it serves the public
+/// pi.ruv.io page from the same service), so every request reaches the
+/// handler and the token is never checked by anything.
+///
+/// The live `brain-inject-push` subscription *does* attach an OIDC token for
+/// `ruvbrain-scheduler@ruv-dev.iam.gserviceaccount.com`, so the fix is to
+/// verify that token here (issuer, audience, signature against Google's
+/// JWKS, and the expected service-account email). Deliberately NOT done in
+/// this change: it needs a new dependency and a decision on the expected
+/// audience, and it cannot be exercised against a real token from a test.
+///
+/// Note that the `AuthenticatedContributor` extractor is the **wrong**
+/// mechanism here — a Google OIDC JWT is well over the extractor's 256-byte
+/// ceiling, so applying it would reject every legitimate push.
 async fn pipeline_pubsub_push(
     State(state): State<AppState>,
     Json(push): Json<PubSubPushMessage>,
@@ -8132,6 +8176,12 @@ async fn email_inbound(
     }
 }
 
+/// Maximum number of concurrent SSE proxy sessions held in `state.sessions`.
+///
+/// Each session pins an entry in two DashMaps and one mpsc channel for the
+/// life of the process, so this is the memory bound on `/internal/session/create`.
+const MAX_SSE_SESSIONS: usize = 1024;
+
 /// Verify the system key for internal endpoints
 fn verify_system_key(headers: &HeaderMap) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     let system_key = std::env::var("BRAIN_SYSTEM_KEY").unwrap_or_default();
@@ -8157,8 +8207,15 @@ fn verify_system_key(headers: &HeaderMap) -> Result<(), (StatusCode, Json<serde_
 // ══════════════════════════════════════════════════════════════════════
 // Internal Queue Endpoints (ADR-130)
 //
-// These are service-to-service endpoints used by the SSE proxy to
-// communicate with the API server. No authentication required.
+// Service-to-service endpoints used by the SSE proxy (`ruvbrain-sse`) to
+// communicate with the API server. They are NOT internal in any network
+// sense: the Cloud Run service grants `roles/run.invoker` to `allUsers`, so
+// `/internal/*` is reachable from the public internet exactly like `/v1/*`.
+//
+// They are therefore gated on the shared `BRAIN_SYSTEM_KEY`, the mechanism
+// `/v1/notify/digest` already uses. DEPLOY DEPENDENCY: the `ruvbrain-sse`
+// service must have `BRAIN_SYSTEM_KEY` in its environment before this
+// change reaches production, or the SSE transport breaks. See the ADR.
 // ══════════════════════════════════════════════════════════════════════
 
 /// Request body for POST /internal/queue/push
@@ -8188,8 +8245,13 @@ struct InternalQueueDrainQuery {
 /// not found, 500 if the channel send fails.
 async fn internal_queue_push(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<InternalQueuePushRequest>,
 ) -> StatusCode {
+    if verify_system_key(&headers).is_err() {
+        return StatusCode::UNAUTHORIZED;
+    }
+
     let sender = match state.sessions.get(&body.session_id) {
         Some(s) => s.clone(),
         None => {
@@ -8222,8 +8284,14 @@ async fn internal_queue_push(
 /// in `internal_session_create`.
 async fn internal_queue_drain(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<InternalQueueDrainQuery>,
 ) -> Json<Vec<String>> {
+    if verify_system_key(&headers).is_err() {
+        // Same shape as an empty drain — callers treat this as "nothing yet".
+        return Json(Vec::new());
+    }
+
     // Swap the buffer with an empty vec to drain atomically
     let messages = state
         .response_queues
@@ -8247,8 +8315,30 @@ async fn internal_queue_drain(
 /// return buffered responses. Returns 200 with the session_id echoed back.
 async fn internal_session_create(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<InternalSessionCreateRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if let Err((status, body)) = verify_system_key(&headers) {
+        return (status, body);
+    }
+
+    // Bound the session table. Each call permanently adds one entry to two
+    // DashMaps plus an mpsc channel; the draining task only cleans up once
+    // the sender is dropped, and the sender lives in `state.sessions`, so
+    // without a cap an unbounded number of `create` calls is an unbounded
+    // memory leak. Re-creating an existing session id is always allowed so a
+    // reconnecting proxy is never locked out by the cap.
+    if !state.sessions.contains_key(&body.session_id) && state.sessions.len() >= MAX_SSE_SESSIONS {
+        tracing::warn!(
+            "internal/session/create: refusing new session, at cap ({})",
+            MAX_SSE_SESSIONS
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "session capacity reached" })),
+        );
+    }
+
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
     state.sessions.insert(body.session_id.clone(), tx);
     state
@@ -8283,8 +8373,13 @@ async fn internal_session_create(
 /// Removes the session and its response queue, then returns 200.
 async fn internal_session_delete(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> StatusCode {
+    if verify_system_key(&headers).is_err() {
+        return StatusCode::UNAUTHORIZED;
+    }
+
     state.sessions.remove(&id);
     state.response_queues.remove(&id);
     tracing::info!("internal/session/delete: removed session {}", id);
