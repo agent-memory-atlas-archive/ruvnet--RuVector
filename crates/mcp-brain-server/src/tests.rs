@@ -1140,4 +1140,135 @@ mod tests {
             );
         }
     }
+
+    // -----------------------------------------------------------------------
+    // P4: list_memories must do work proportional to the page, not the corpus.
+    //
+    // It used to clone every matching BrainMemory (each carrying a 384-dim
+    // embedding), sort all of them, then throw away all but `limit`. The
+    // rewrite sorts 24-byte keys and clones only the returned rows, so these
+    // tests pin the ORDERING CONTRACT that rewrite has to preserve.
+    // -----------------------------------------------------------------------
+
+    /// Reference implementation: the old "clone everything, sort everything,
+    /// then paginate" behaviour, with the new deterministic id tie-break.
+    fn reference_page(
+        mut all: Vec<crate::types::BrainMemory>,
+        sort: &crate::types::ListSort,
+        limit: usize,
+        offset: usize,
+    ) -> Vec<uuid::Uuid> {
+        use crate::types::ListSort;
+        all.sort_by(|a, b| {
+            let (ka, kb) = match sort {
+                ListSort::UpdatedAt => (
+                    a.updated_at.timestamp_micros() as f64,
+                    b.updated_at.timestamp_micros() as f64,
+                ),
+                ListSort::Quality => (a.quality_score.mean(), b.quality_score.mean()),
+                ListSort::Votes => (
+                    a.quality_score.observations(),
+                    b.quality_score.observations(),
+                ),
+            };
+            kb.partial_cmp(&ka)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        all.into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|m| m.id)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn list_memories_pagination_matches_a_full_sort_including_ties() {
+        use crate::types::ListSort;
+
+        let store = crate::store::FirestoreClient::new();
+        let mut all = Vec::new();
+
+        // Deliberately heavy tie density: only 4 distinct quality values and
+        // 3 distinct vote counts across 40 rows, so the tie-break path is
+        // exercised on every sort mode.
+        for i in 0..40u32 {
+            let mut m = memory_with(&format!("mem {i}"), "content");
+            m.quality_score = crate::types::BetaParams {
+                alpha: 1.0 + f64::from(i % 4),
+                beta: 1.0,
+            };
+            m.updated_at = chrono::Utc::now() - chrono::Duration::seconds(i64::from(i % 7));
+            all.push(m.clone());
+            store.store_memory(m).await.expect("store_memory");
+        }
+
+        for sort in [ListSort::UpdatedAt, ListSort::Quality, ListSort::Votes] {
+            for (limit, offset) in [
+                (5, 0),
+                (5, 10),
+                (1, 0),
+                (40, 0),
+                (10, 35),
+                (7, 39),
+                (5, 100),
+            ] {
+                let (page, total) = store
+                    .list_memories(None, None, limit, offset, &sort)
+                    .await
+                    .expect("list_memories");
+
+                assert_eq!(total, 40, "total_count must be the full match count");
+
+                let got: Vec<_> = page.iter().map(|m| m.id).collect();
+                let want = reference_page(all.clone(), &sort, limit, offset);
+                assert_eq!(
+                    got, want,
+                    "sort={sort:?} limit={limit} offset={offset}: page must match a full sort"
+                );
+            }
+        }
+    }
+
+    /// Identical requests must return identical pages. Before the rewrite,
+    /// rows with equal sort keys were ordered by DashMap iteration order.
+    #[tokio::test]
+    async fn list_memories_is_deterministic_across_identical_calls() {
+        use crate::types::ListSort;
+
+        let store = crate::store::FirestoreClient::new();
+        for i in 0..30u32 {
+            let mut m = memory_with(&format!("mem {i}"), "content");
+            // Every row has the SAME quality — pure tie-break territory.
+            m.quality_score = crate::types::BetaParams {
+                alpha: 2.0,
+                beta: 1.0,
+            };
+            store.store_memory(m).await.expect("store_memory");
+        }
+
+        let first: Vec<_> = store
+            .list_memories(None, None, 8, 4, &ListSort::Quality)
+            .await
+            .unwrap()
+            .0
+            .iter()
+            .map(|m| m.id)
+            .collect();
+
+        for _ in 0..6 {
+            let again: Vec<_> = store
+                .list_memories(None, None, 8, 4, &ListSort::Quality)
+                .await
+                .unwrap()
+                .0
+                .iter()
+                .map(|m| m.id)
+                .collect();
+            assert_eq!(
+                again, first,
+                "identical requests must return identical pages"
+            );
+        }
+    }
 }
