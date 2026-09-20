@@ -943,4 +943,112 @@ mod tests {
             .expect("owner delete should not error");
         assert!(deleted);
     }
+
+    // -----------------------------------------------------------------------
+    // P2: `ranked_search` must not need a write lock.
+    //
+    // Every inject marks the CSR cache dirty; the next search rebuilt it.
+    // While `ranked_search` took `&mut self`, that rebuild happened under a
+    // write lock on the whole graph, so one search blocked every reader.
+    // -----------------------------------------------------------------------
+
+    fn graph_with_memories(n: usize) -> crate::graph::KnowledgeGraph {
+        let mut g = crate::graph::KnowledgeGraph::new();
+        for i in 0..n {
+            let mut m = memory_with(&format!("mem {i}"), "content");
+            // Embeddings close enough to clear the 0.55 similarity threshold
+            // so real edges exist and the CSR is non-empty.
+            let mut e = vec![0.9f32; 8];
+            e[i % 8] += 0.3;
+            crate::graph::normalize_embedding(&mut e);
+            m.embedding = e;
+            g.add_memory(&m);
+        }
+        g
+    }
+
+    /// The whole point of the change: a search runs with only a READ lock,
+    /// and two readers can hold that lock at the same time. Under the old
+    /// `&mut self` signature this did not compile; if it ever regresses to
+    /// needing a write lock, `.read()` below stops compiling again.
+    #[test]
+    fn ranked_search_runs_concurrently_under_shared_read_locks() {
+        let graph = std::sync::Arc::new(parking_lot::RwLock::new(graph_with_memories(24)));
+        let query = {
+            let mut q = vec![0.9f32; 8];
+            q[0] += 0.3;
+            crate::graph::normalize_embedding(&mut q);
+            q
+        };
+
+        // Hold a read guard on this thread for the whole test...
+        let held = graph.read();
+        let from_held = held.ranked_search(&query, 5);
+        assert!(!from_held.is_empty(), "search should return results");
+
+        // ...while another thread also takes a read guard and searches.
+        // This deadlocks (or fails to compile) if a write lock is required.
+        let g2 = std::sync::Arc::clone(&graph);
+        let q2 = query.clone();
+        let other = std::thread::spawn(move || g2.read().ranked_search(&q2, 5));
+        let from_other = other
+            .join()
+            .expect("concurrent reader panicked or deadlocked");
+
+        assert_eq!(
+            from_held.len(),
+            from_other.len(),
+            "both readers should see the same result set"
+        );
+        drop(held);
+    }
+
+    /// The lazy rebuild must still be correct: a search after an insert
+    /// reflects the new edges, i.e. there is no staleness window.
+    #[test]
+    fn ranked_search_after_insert_sees_the_rebuilt_csr() {
+        let mut g = graph_with_memories(12);
+        let query = {
+            let mut q = vec![0.9f32; 8];
+            q[3] += 0.3;
+            crate::graph::normalize_embedding(&mut q);
+            q
+        };
+
+        let before = g.ranked_search(&query, 20);
+
+        // Insert a new memory — this marks the CSR dirty.
+        let mut m = memory_with("fresh", "content");
+        let mut e = vec![0.9f32; 8];
+        e[3] += 0.3;
+        crate::graph::normalize_embedding(&mut e);
+        m.embedding = e;
+        let new_id = m.id;
+        g.add_memory(&m);
+
+        // A read-only search must already include it.
+        let after = (&g).ranked_search(&query, 20);
+        assert_eq!(after.len(), before.len() + 1, "new memory should be ranked");
+        assert!(
+            after.iter().any(|(id, _)| *id == new_id),
+            "the just-inserted memory must appear without an explicit rebuild"
+        );
+    }
+
+    /// Repeated searches with no intervening write are stable — the
+    /// double-checked rebuild must not clear or corrupt the cache.
+    #[test]
+    fn repeated_searches_are_stable_without_writes() {
+        let g = graph_with_memories(16);
+        let query = {
+            let mut q = vec![0.9f32; 8];
+            q[1] += 0.3;
+            crate::graph::normalize_embedding(&mut q);
+            q
+        };
+        let first = g.ranked_search(&query, 8);
+        for _ in 0..5 {
+            assert_eq!(g.ranked_search(&query, 8), first);
+        }
+    }
 }

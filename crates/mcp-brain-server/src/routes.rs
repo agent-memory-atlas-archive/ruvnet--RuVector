@@ -1917,9 +1917,13 @@ async fn search_memories(
     let expanded_tokens = expand_synonyms(&query_tokens);
 
     // ── Graph PPR scores: blend cosine+PageRank from knowledge graph ──
-    // Use write lock briefly: ranked_search may lazily rebuild CSR cache
+    // Read lock: the CSR cache has its own interior lock, so `ranked_search`
+    // can rebuild it lazily without excluding every other reader. Before this,
+    // every inject marked the CSR dirty and the next search took a WRITE lock
+    // on the whole graph for the duration of a full rebuild (~1.2M edges in
+    // production), serialising all traffic behind it.
     let graph_scores: std::collections::HashMap<Uuid, f64> = {
-        let mut g = state.graph.write();
+        let g = state.graph.read();
         if g.node_count() >= 3 {
             g.ranked_search(&query_embedding, limit * 3)
                 .into_iter()

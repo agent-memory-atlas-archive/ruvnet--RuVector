@@ -13,6 +13,8 @@ use ruvector_solver::types::CsrMatrix;
 use ruvector_sparsifier::traits::Sparsifier;
 use ruvector_sparsifier::{AdaptiveGeoSpar, SparseGraph, SparsifierConfig};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// Knowledge graph maintaining similarity relationships
@@ -22,14 +24,22 @@ pub struct KnowledgeGraph {
     similarity_threshold: f64,
     /// Real min-cut structure (lazy-initialized)
     mincut: Option<DynamicMinCut>,
-    /// CSR cache for solver-based search
-    csr_cache: Option<CsrMatrix<f64>>,
+    /// CSR cache for solver-based search.
+    ///
+    /// Behind its own lock, with interior mutability, so the lazy rebuild
+    /// does not force `ranked_search` to be `&mut self`. Taking a write lock
+    /// on the whole graph to read it was the reason every search after an
+    /// inject blocked every other reader.
+    csr_cache: parking_lot::RwLock<Option<Arc<CsrMatrix<f64>>>>,
     /// Maps graph indices to memory IDs
     node_ids: Vec<Uuid>,
     /// Reverse index: Uuid → position in node_ids (O(1) lookup)
     node_index: HashMap<Uuid, usize>,
     /// Whether the CSR cache needs rebuilding
-    csr_dirty: bool,
+    csr_dirty: AtomicBool,
+    /// Serialises CSR rebuilds so N concurrent first-searches after an inject
+    /// rebuild once between them instead of N times.
+    csr_build: parking_lot::Mutex<()>,
     /// Spectral sparsifier for compressed graph analytics (ADR-116)
     sparsifier: Option<AdaptiveGeoSpar>,
 }
@@ -55,10 +65,11 @@ impl KnowledgeGraph {
             edges: Vec::new(),
             similarity_threshold: 0.55,
             mincut: None,
-            csr_cache: None,
+            csr_cache: parking_lot::RwLock::new(None),
             node_ids: Vec::new(),
             node_index: HashMap::new(),
-            csr_dirty: false,
+            csr_dirty: AtomicBool::new(false),
+            csr_build: parking_lot::Mutex::new(()),
             sparsifier: None,
         }
     }
@@ -78,8 +89,7 @@ impl KnowledgeGraph {
         self.edges.clear();
         self.node_ids.clear();
         self.node_index.clear();
-        self.csr_dirty = true;
-        self.csr_cache = None;
+        self.mark_csr_dirty();
         self.mincut = None;
         self.sparsifier = None;
 
@@ -230,7 +240,7 @@ impl KnowledgeGraph {
         self.edges.extend(new_edges);
 
         // Mark CSR as dirty — deferred rebuild until next query
-        self.csr_dirty = true;
+        self.mark_csr_dirty();
     }
 
     /// Remove a memory from the graph
@@ -263,8 +273,8 @@ impl KnowledgeGraph {
         }
         // Invalidate caches — full rebuild needed
         self.mincut = None;
-        self.csr_cache = None;
-        self.csr_dirty = false;
+        *self.csr_cache.write() = None;
+        self.csr_dirty.store(false, Ordering::Release);
         // Sparsifier indices are now stale after compaction — rebuild lazily
         self.sparsifier = None;
     }
@@ -274,7 +284,7 @@ impl KnowledgeGraph {
     /// Uses ForwardPushSolver PPR for graph-aware relevance when CSR is
     /// available, merging with cosine similarity scores. Falls back to
     /// brute-force cosine if CSR is unavailable.
-    pub fn ranked_search(&mut self, query_embedding: &[f32], k: usize) -> Vec<(Uuid, f64)> {
+    pub fn ranked_search(&self, query_embedding: &[f32], k: usize) -> Vec<(Uuid, f64)> {
         self.ensure_csr();
         // Brute-force cosine scores
         let mut cosine_scores: Vec<(Uuid, f64)> = self
@@ -302,7 +312,7 @@ impl KnowledgeGraph {
     /// Builds a CsrMatrix from graph edges and runs PPR from the node
     /// most similar to `query_embedding`. Returns a map of node ID to
     /// PPR score, or `None` if PPR cannot be computed.
-    pub fn pagerank_search(&mut self, query_embedding: &[f32], k: usize) -> Vec<(Uuid, f64)> {
+    pub fn pagerank_search(&self, query_embedding: &[f32], k: usize) -> Vec<(Uuid, f64)> {
         self.ensure_csr();
         if let Some(ppr_map) = self.pagerank_scores(query_embedding, k) {
             let mut results: Vec<(Uuid, f64)> = ppr_map.into_iter().collect();
@@ -314,17 +324,41 @@ impl KnowledgeGraph {
         }
     }
 
-    /// Ensure CSR cache is up-to-date (lazy rebuild)
-    fn ensure_csr(&mut self) {
-        if self.csr_dirty {
-            self.rebuild_csr();
-            self.csr_dirty = false;
+    /// Mark the CSR cache stale. Cheap; the rebuild is deferred to the next
+    /// query that actually needs it.
+    fn mark_csr_dirty(&self) {
+        self.csr_dirty.store(true, Ordering::Release);
+    }
+
+    /// Ensure the CSR cache is up-to-date (lazy rebuild).
+    ///
+    /// Takes `&self`: the cache lives behind its own lock, so a search no
+    /// longer needs a write lock on the whole graph. Double-checked under
+    /// `csr_build` so a burst of concurrent searches after an inject performs
+    /// exactly one rebuild rather than one per thread.
+    ///
+    /// The rebuild is still synchronous, so a search never runs against a
+    /// stale CSR — this fixes the lock contention without introducing a
+    /// staleness window.
+    fn ensure_csr(&self) {
+        if !self.csr_dirty.load(Ordering::Acquire) {
+            return;
         }
+        let _build = self.csr_build.lock();
+        // Re-check: another thread may have rebuilt while we waited.
+        if !self.csr_dirty.load(Ordering::Acquire) {
+            return;
+        }
+        self.rebuild_csr();
+        self.csr_dirty.store(false, Ordering::Release);
     }
 
     /// Internal: compute raw PPR scores keyed by node ID.
     fn pagerank_scores(&self, query_embedding: &[f32], k: usize) -> Option<HashMap<Uuid, f64>> {
-        let csr = self.csr_cache.as_ref()?;
+        // Clone the Arc out and release the cache lock immediately, so a
+        // concurrent rebuild is never blocked by a long-running PPR solve.
+        let csr = self.csr_cache.read().clone()?;
+        let csr = csr.as_ref();
         if csr.rows == 0 {
             return None;
         }
@@ -730,10 +764,10 @@ impl KnowledgeGraph {
     }
 
     /// Rebuild the CsrMatrix from the adjacency list
-    pub fn rebuild_csr(&mut self) {
+    pub fn rebuild_csr(&self) {
         let n = self.node_ids.len();
         if n == 0 {
-            self.csr_cache = None;
+            *self.csr_cache.write() = None;
             return;
         }
 
@@ -747,7 +781,10 @@ impl KnowledgeGraph {
             })
             .collect();
 
-        self.csr_cache = Some(CsrMatrix::<f64>::from_coo(n, n, entries));
+        // Build the new matrix before taking the cache write lock, so readers
+        // only ever wait for the pointer swap, not for the O(edges) build.
+        let built = CsrMatrix::<f64>::from_coo(n, n, entries);
+        *self.csr_cache.write() = Some(Arc::new(built));
     }
 
     /// Get the k nearest graph neighbors for a given memory ID.
