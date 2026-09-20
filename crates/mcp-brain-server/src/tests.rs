@@ -1051,4 +1051,93 @@ mod tests {
             assert_eq!(g.ranked_search(&query, 8), first);
         }
     }
+
+    // -----------------------------------------------------------------------
+    // P3: the cold-start sparsifier build must hold no lock.
+    //
+    // `spawn_blocking(|| graph.write().rebuild_sparsifier())` kept the tokio
+    // runtime free but held the write guard for the whole build. The build is
+    // now snapshot -> build off-lock -> guarded install.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sparsifier_builds_from_a_snapshot_with_no_graph_borrowed() {
+        let g = graph_with_memories(40);
+        let (entries, nodes, edges) = g
+            .sparsifier_snapshot()
+            .expect("graph should yield a snapshot");
+        assert!(edges > 0 && nodes == 40);
+
+        // The build takes plain data — no `&self`, so nothing is locked. This
+        // is exactly the call the background task makes inside spawn_blocking.
+        let built = crate::graph::KnowledgeGraph::build_sparsifier_from(&entries, nodes);
+
+        let mut g = g;
+        if let Some(spar) = built {
+            assert!(
+                g.install_sparsifier(spar, nodes, edges),
+                "install should succeed when the graph is unchanged"
+            );
+            assert!(g.sparsifier_stats().is_some());
+        }
+    }
+
+    /// Edges appended while the build runs must be replayed on install —
+    /// `add_memory` cannot feed a sparsifier that is still `None`.
+    #[test]
+    fn install_replays_edges_added_during_the_build() {
+        let mut g = graph_with_memories(40);
+        let (entries, nodes, edges) = g.sparsifier_snapshot().unwrap();
+        let built = crate::graph::KnowledgeGraph::build_sparsifier_from(&entries, nodes);
+
+        // Simulate an inject landing mid-build.
+        let mut m = memory_with("mid-build", "content");
+        let mut e = vec![0.9f32; 8];
+        e[2] += 0.3;
+        crate::graph::normalize_embedding(&mut e);
+        m.embedding = e;
+        g.add_memory(&m);
+        let edges_after = g.edge_count();
+        assert!(edges_after > edges, "the inject should have added edges");
+
+        if let Some(spar) = built {
+            assert!(
+                g.install_sparsifier(spar, nodes, edges),
+                "install should still succeed after a concurrent append"
+            );
+            let stats = g.sparsifier_stats().expect("stats after install");
+            assert_eq!(
+                stats.full_edges, edges_after,
+                "the installed sparsifier must account for every edge, including \
+                 the ones added during the build"
+            );
+        }
+    }
+
+    /// If the graph SHRANK during the build, node positions were reassigned by
+    /// `remove_memory` and the built sparsifier refers to the wrong nodes.
+    /// The install must refuse rather than silently corrupt analytics.
+    #[test]
+    fn install_refuses_when_the_graph_shrank_during_the_build() {
+        let mut g = graph_with_memories(40);
+        let (entries, nodes, edges) = g.sparsifier_snapshot().unwrap();
+        let built = crate::graph::KnowledgeGraph::build_sparsifier_from(&entries, nodes);
+
+        // Simulate a delete landing mid-build. remove_memory reindexes every
+        // node position, which is exactly what invalidates the built matrix.
+        let to_remove = g.node_ids_snapshot()[0];
+        g.remove_memory(&to_remove);
+        assert!(g.edge_count() < edges || g.node_count() < nodes);
+
+        if let Some(spar) = built {
+            assert!(
+                !g.install_sparsifier(spar, nodes, edges),
+                "install must refuse a sparsifier built against stale indices"
+            );
+            assert!(
+                g.sparsifier_stats().is_none(),
+                "no sparsifier should be installed after a refused install"
+            );
+        }
+    }
 }

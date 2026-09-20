@@ -173,36 +173,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // ── Background sparsifier build for large graphs ──
-    // Deferred from startup to avoid blocking the health probe.
-    // For very large graphs (>5M edges), skip the sparsifier entirely — it
-    // holds a write lock that blocks all readers and pegs the CPU, causing
-    // Cloud Run to 504 every request while it runs.
+    //
+    // Deferred from startup to avoid blocking the health probe, and now built
+    // with NO lock held.
+    //
+    // The previous version wrapped `graph.write().rebuild_sparsifier()` in
+    // `spawn_blocking`. That fixes runtime starvation — the build no longer
+    // occupies one of the two tokio workers — but it does NOT fix lock
+    // contention: the write guard was taken inside the blocking closure and
+    // held for the entire build, so every reader still stalled behind it. The
+    // live graph (~1.2M edges) sits inside the 100k..5M band, so this ran on
+    // every cold start and is one of the three independent 504 mechanisms.
+    //
+    // Now: snapshot under a read lock, build off-lock, install under a brief
+    // write lock. `install_sparsifier` replays edges added during the build
+    // and refuses the install outright if the graph shrank underneath it.
     let spar_state = state.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         let edge_count = spar_state.graph.read().edge_count();
         if edge_count > 5_000_000 {
+            // The >5M skip predates the off-lock build; the reason given for
+            // it (a write lock held across the whole build) no longer applies.
+            // Left in place deliberately — CPU cost at that size has not been
+            // measured, so widening it would be a guess.
             tracing::info!(
                 "Skipping sparsifier build: graph too large ({edge_count} edges, >5M threshold)"
             );
         } else if edge_count > 100_000 && spar_state.graph.read().sparsifier_stats().is_none() {
             tracing::info!("Background sparsifier build starting ({edge_count} edges)");
-            // Run in spawn_blocking to avoid starving the tokio runtime
-            let graph = spar_state.graph.clone();
-            tokio::task::spawn_blocking(move || {
-                graph.write().rebuild_sparsifier();
+
+            let snapshot = spar_state.graph.read().sparsifier_snapshot();
+            let Some((entries, snap_nodes, snap_edges)) = snapshot else {
+                tracing::info!("Sparsifier build skipped: empty graph snapshot");
+                return;
+            };
+
+            // Build with no lock held at all — only the tokio runtime is
+            // protected here, which is what spawn_blocking is actually for.
+            let built = tokio::task::spawn_blocking(move || {
+                mcp_brain_server::graph::KnowledgeGraph::build_sparsifier_from(&entries, snap_nodes)
             })
             .await
-            .ok();
-            let stats = spar_state.graph.read().sparsifier_stats();
-            if let Some(s) = stats {
+            .ok()
+            .flatten();
+
+            match built {
+                Some(spar) => {
+                    let installed = spar_state
+                        .graph
+                        .write()
+                        .install_sparsifier(spar, snap_nodes, snap_edges);
+                    if !installed {
+                        tracing::warn!("Sparsifier build discarded (graph changed during build)");
+                    }
+                }
+                None => tracing::warn!("Sparsifier build returned no sparsifier"),
+            }
+
+            if let Some(s) = spar_state.graph.read().sparsifier_stats() {
                 tracing::info!(
                     "Sparsifier built: {} edges, {:.1}x compression",
                     s.sparsified_edges,
                     s.compression_ratio
                 );
-            } else {
-                tracing::warn!("Sparsifier build returned no stats");
             }
         }
     });

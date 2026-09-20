@@ -813,11 +813,31 @@ impl KnowledgeGraph {
         self.nodes.len()
     }
 
+    /// The node ids in index order. Exposed for tests that need to name a
+    /// specific node (e.g. to drive `remove_memory`).
+    pub fn node_ids_snapshot(&self) -> Vec<Uuid> {
+        self.node_ids.clone()
+    }
+
     pub fn edge_count(&self) -> usize {
         self.edges.len()
     }
 
     // ----- Sparsifier (ADR-116) -----------------------------------------------
+
+    /// Tuning shared by the in-place and off-lock sparsifier builds.
+    fn sparsifier_config() -> SparsifierConfig {
+        SparsifierConfig {
+            epsilon: 0.2,
+            edge_budget_factor: 8,
+            audit_interval: 500,
+            walk_length: 6,
+            num_walks: 10,
+            n_audit_probes: 30,
+            auto_rebuild_on_audit_failure: true,
+            ..Default::default()
+        }
+    }
 
     /// Initialize or rebuild the spectral sparsifier from current edges.
     pub fn rebuild_sparsifier(&mut self) {
@@ -836,18 +856,7 @@ impl KnowledgeGraph {
             }
         }
 
-        let config = SparsifierConfig {
-            epsilon: 0.2,
-            edge_budget_factor: 8,
-            audit_interval: 500,
-            walk_length: 6,
-            num_walks: 10,
-            n_audit_probes: 30,
-            auto_rebuild_on_audit_failure: true,
-            ..Default::default()
-        };
-
-        match AdaptiveGeoSpar::build(&sg, config) {
+        match AdaptiveGeoSpar::build(&sg, Self::sparsifier_config()) {
             Ok(spar) => {
                 tracing::info!(
                     full_edges = self.edges.len(),
@@ -862,6 +871,103 @@ impl KnowledgeGraph {
                 self.sparsifier = None;
             }
         }
+    }
+
+    /// Snapshot everything the sparsifier build needs, as plain data.
+    ///
+    /// Returned under a *read* lock and then used with no lock held at all,
+    /// so the expensive `AdaptiveGeoSpar::build` no longer runs inside
+    /// `graph.write()`. Returns `(coo_entries, node_count, edge_count)`;
+    /// the two counts are the guard values for `install_sparsifier`.
+    pub fn sparsifier_snapshot(&self) -> Option<(Vec<(usize, usize, f64)>, usize, usize)> {
+        if self.node_ids.is_empty() || self.edges.is_empty() {
+            return None;
+        }
+        let entries: Vec<(usize, usize, f64)> = self
+            .edges
+            .iter()
+            .filter_map(|e| {
+                let &u = self.node_index.get(&e.source)?;
+                let &v = self.node_index.get(&e.target)?;
+                Some((u, v, e.weight))
+            })
+            .collect();
+        Some((entries, self.node_ids.len(), self.edges.len()))
+    }
+
+    /// Build a sparsifier from a snapshot. Pure — holds no lock, touches no
+    /// `self`, and is safe to call from `spawn_blocking`.
+    pub fn build_sparsifier_from(
+        entries: &[(usize, usize, f64)],
+        node_count: usize,
+    ) -> Option<AdaptiveGeoSpar> {
+        if node_count == 0 || entries.is_empty() {
+            return None;
+        }
+        let mut sg = SparseGraph::with_capacity(node_count);
+        for &(u, v, w) in entries {
+            let _ = sg.insert_or_update_edge(u, v, w);
+        }
+        match AdaptiveGeoSpar::build(&sg, Self::sparsifier_config()) {
+            Ok(spar) => Some(spar),
+            Err(e) => {
+                tracing::warn!("Sparsifier build failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// Install a sparsifier built from a snapshot, under a brief write lock.
+    ///
+    /// Refuses the install if the graph shrank while the build ran: node
+    /// positions are reassigned by `remove_memory`, so a sparsifier built
+    /// against the old indices would silently refer to the wrong nodes.
+    ///
+    /// Edges appended during the build are replayed, because `add_memory`
+    /// only feeds the sparsifier while it is `Some` — and it was `None` for
+    /// the whole build window, so those edges are otherwise lost.
+    ///
+    /// Returns whether the sparsifier was installed.
+    pub fn install_sparsifier(
+        &mut self,
+        spar: AdaptiveGeoSpar,
+        snapshot_nodes: usize,
+        snapshot_edges: usize,
+    ) -> bool {
+        if self.node_ids.len() < snapshot_nodes || self.edges.len() < snapshot_edges {
+            tracing::warn!(
+                "Discarding sparsifier build: graph shrank during build \
+                 (nodes {} -> {}, edges {} -> {})",
+                snapshot_nodes,
+                self.node_ids.len(),
+                snapshot_edges,
+                self.edges.len()
+            );
+            return false;
+        }
+
+        let mut spar = spar;
+        let replayed = self.edges.len() - snapshot_edges;
+        for edge in &self.edges[snapshot_edges..] {
+            if let (Some(&u), Some(&v)) = (
+                self.node_index.get(&edge.source),
+                self.node_index.get(&edge.target),
+            ) {
+                let _ = spar.insert_edge(u, v, edge.weight);
+            }
+        }
+        if replayed > 0 {
+            tracing::info!("Replayed {replayed} edges added during sparsifier build");
+        }
+
+        tracing::info!(
+            full_edges = self.edges.len(),
+            sparsified_edges = spar.sparsifier().num_edges(),
+            compression = %format!("{:.1}x", spar.compression_ratio()),
+            "Sparsifier installed"
+        );
+        self.sparsifier = Some(spar);
+        true
     }
 
     /// Ensure the sparsifier is initialized (lazy build on first access).
