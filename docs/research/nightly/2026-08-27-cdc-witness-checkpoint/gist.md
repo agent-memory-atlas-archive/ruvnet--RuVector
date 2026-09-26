@@ -1,5 +1,15 @@
 # Content-Defined Chunking Cuts Vector-Index Checkpoint Bytes by ~8-19x
 
+**Update (2026-09-26):** the numbers below were originally measured
+against a synthetic index format. They have since been re-measured
+against `ruvector-snapshot`'s real production format via a new
+`CdcLocalStorage` backend (`ruvector-snapshot`'s `cdc` feature) — see
+[the nightly README's Update section](README.md#update-2026-09-26-real-format-integration-and-comparison)
+and [ADR-350](../../../adr/ADR-350-cdc-witness-checkpoint.md). The real
+steady-state ratio (5.11%) closely matches the original synthetic-format
+estimate (5.19%), and reconstruction is now verified through the actual
+production bincode decode path, not a synthetic one.
+
 ## Problem
 
 Vector/graph indexes used as agent memory are increasingly checkpointed
@@ -105,7 +115,7 @@ free further improvement.
 
 Full raw output, methodology, and 15 passing unit tests are in the
 [nightly research README](README.md) and
-[ADR-340](../../../adr/ADR-340-cdc-witness-checkpoint.md).
+[ADR-350](../../../adr/ADR-350-cdc-witness-checkpoint.md).
 
 ## Limitations
 

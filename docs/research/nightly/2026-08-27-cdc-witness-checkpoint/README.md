@@ -2,9 +2,71 @@
 
 **150-char summary:** FastCDC-style chunking cuts per-round agent-memory checkpoint bytes to ~12% of fixed-block and ~5% of full-snapshot, witness-chained, reconstruction exact.
 
-**Date:** 2026-08-27
+**Date:** 2026-08-27 (real-format integration added 2026-09-26)
 **Crate:** `crates/ruvector-cdc-checkpoint`
-**ADR:** [ADR-340](../../../adr/ADR-340-cdc-witness-checkpoint.md)
+**ADR:** [ADR-350](../../../adr/ADR-350-cdc-witness-checkpoint.md)
+
+---
+
+## Update (2026-09-26): Real-Format Integration and Comparison
+
+A PR-cleanup review of #936 asked for exactly the right thing this
+document originally flagged as its main limitation: **"a comparison
+against the existing RuVector implementation rather than a new in-crate
+baseline, plus integration into the system path it is meant to
+improve."** Both are now done, not just planned:
+
+- **Integration:** `crates/ruvector-snapshot` gained an optional `cdc`
+  feature (`CdcLocalStorage`, in `src/cdc_storage.rs`) implementing the
+  crate's own `SnapshotStorage` trait — a real, drop-in alternative to
+  `LocalStorage`, off by default. `WitnessChain::resume(prev_root)` was
+  added to `ruvector-cdc-checkpoint` (a small, justified public-API
+  addition) so the chain can continue across process restarts instead of
+  starting fresh at `GENESIS_ROOT` every time.
+- **Comparison against the existing implementation:** the benchmark now
+  builds real `ruvector_snapshot::SnapshotData`/`VectorRecord` values,
+  serializes them with the exact same `bincode::config::standard()` call
+  `LocalStorage::save` uses, and measures `LocalStorage::save`'s actual
+  gzip'd, checksummed, disk-written bytes as the baseline — not a
+  synthetic reimplementation of the format.
+
+**New measured result** (`cargo run --release -p ruvector-snapshot
+--features cdc --bin cdc_benchmark`, same 20,000-row / dim-128 / 30-round
+churn schedule as the original synthetic benchmark, now on the real
+production path):
+
+| Backend | cumulative bytes over 30 rounds | steady-state avg bytes/round (rounds 1-29) |
+|---|---|---|
+| `LocalStorage` (production, real gzip'd full snapshot every round) | 281,460,523 | 9,386,649 |
+| `CdcLocalStorage` (this work, real bincode + CDC + per-chunk gzip + dedup) | **23,571,438** | **479,335** |
+
+Steady-state ratio: **5.11%** (CDC/LocalStorage) — matching the original
+synthetic-format estimate of 5.19% closely, and now backed by the real
+production format, real gzip compression, and round-trip-verified through
+`ruvector_snapshot`'s actual bincode decode path (100% correct, both
+backends, all 30 rounds, in a real `#[tokio::test]` integration test:
+`crates/ruvector-snapshot/tests/cdc_storage_comparison.rs`).
+
+One real, disclosed tradeoff this synthetic benchmark could not show:
+at round 0 (cold start), `CdcLocalStorage` writes slightly *more* bytes
+than `LocalStorage` (9,670,707 vs 9,247,696) — gzipping each ~2 KB chunk
+independently gives gzip a much smaller compression window than gzipping
+the whole ~13 MB blob at once, so per-chunk compression is measurably
+less space-efficient on content with no prior history to deduplicate
+against. The incremental-round dedup advantage (this section's whole
+point) only shows up from round 1 onward, which is exactly the
+production-relevant case — a checkpoint system spends nearly all its
+life doing incremental rounds, not cold starts — but it is a real,
+measured cost, not zero.
+
+Full raw output: `docs/research/nightly/2026-08-27-cdc-witness-checkpoint/real_format_benchmark_raw.txt`
+(also inlined below in [Real-Format Benchmark Results](#real-format-benchmark-results-2026-09-26)).
+See [ADR-350](../../../adr/ADR-350-cdc-witness-checkpoint.md) for the
+updated Decision, Consequences, and Rejection Criteria.
+
+The rest of this document is the original 2026-08-27 synthetic-format
+research record, kept intact rather than rewritten, per this repository's
+practice of retaining prior evidence rather than replacing it in place.
 
 ---
 
@@ -587,10 +649,56 @@ following hold on re-measurement at larger scale or against the real
   chunk count) becomes a material fraction of the bytes saved at very
   long checkpoint histories — not measured beyond 30 rounds here.
 
+## Real-Format Benchmark Results (2026-09-26)
+
+`cargo run --release -p ruvector-snapshot --features cdc --bin cdc_benchmark`
+(hardware: x86-64, Linux, same machine class as the original run):
+
+```text
+==========================================================
+ ruvector-snapshot — CDC vs. real LocalStorage benchmark
+==========================================================
+OS               : linux
+Arch             : x86_64
+Workload         : n=20000 dim=128 seed=0xC0FFEE0012345678 rounds=30 (real SnapshotData/VectorRecord/bincode/gzip)
+Churn/round      : insert=40 delete=20 update=60 (of 20000 rows)
+
+round  0: local.size_bytes=   9247696  cdc.new_bytes_this_round=   9670707  cdc_dir_total=   9670707
+round  1: local.size_bytes=   9256967  cdc.new_bytes_this_round=    472117  cdc_dir_total=  10142824
+round 15: local.size_bytes=   9386720  cdc.new_bytes_this_round=    512333  cdc_dir_total=  16943941
+round 29: local.size_bytes=   9516141  cdc.new_bytes_this_round=    480050  cdc_dir_total=  23571438
+
+LocalStorage cumulative bytes written (30 rounds): 281460523
+CdcLocalStorage on-disk size after 30 rounds:       23571438
+ratio (cdc_dir_final / local_cumulative):              0.0837
+reconstruction correctness: 100% (asserted every round, both backends, real production decode path)
+==========================================================
+```
+
+(Full 30-round table, all rounds, is preserved verbatim in
+`real_format_benchmark_raw.txt` alongside this README.) The cumulative
+ratio (8.37%) includes round 0's cold-start cost, where `CdcLocalStorage`
+writes slightly more than `LocalStorage` (see the Update section above);
+the steady-state ratio excluding round 0 is **5.11%**, matching the
+original synthetic-format estimate (5.19%) within noise.
+
+`cargo test -p ruvector-snapshot --features cdc`: all 10 pre-existing
+tests still pass unmodified, plus the new
+`cdc_backend_round_trips_exactly_against_real_local_storage_format`
+integration test (real `SnapshotData`, 10 rounds of churn, both backends'
+`load()` verified byte-for-byte against the source rows).
+`cargo test -p ruvector-snapshot` (no `cdc` feature): unaffected, same 10
+tests, confirming the new feature is genuinely opt-in and changes nothing
+for existing callers.
+
 ## Limitations
 
-- Synthetic index format, not `ruvector-core`'s real HNSW binary layout —
-  see [Why a Synthetic Index](#why-a-synthetic-index-not-ruvector-cores-real-layout).
+- ~~Synthetic index format, not `ruvector-snapshot`'s real serialization~~
+  — **resolved 2026-09-26**: `CdcLocalStorage` now uses production
+  `SnapshotData`/`VectorRecord`/bincode/gzip directly; see the Update
+  section above. The *original* synthetic-format benchmark and its
+  numbers below are kept as the historical record of the first
+  measurement, not deleted or silently replaced.
 - Single churn profile (0.2%/0.1%/0.3% insert/delete/update per round) at
   a single scale (20,000 rows, 30 rounds); no sweep across collection
   sizes or churn intensities beyond the 4-point CDC `avg_size` sweep.
@@ -599,6 +707,15 @@ following hold on re-measurement at larger scale or against the real
 - No signing of chain roots — witness manifests are commitments only,
   the same open item `ruvector-proof-gate` and `ruvector-retrieval-receipt`
   already carry.
+- `CdcLocalStorage` has no chunk garbage collection: `delete()` removes a
+  snapshot's manifest but never its chunks (a sibling snapshot of the same
+  collection may still reference them), so storage only grows. Disclosed
+  in `cdc_storage.rs`'s module docs, not fixed here.
+- `CdcLocalStorage`'s round/chain-root bookkeeping has no cross-process
+  locking beyond a single in-process `tokio::sync::Mutex` — concurrent
+  `save()` calls for the same collection from different processes can
+  race. Acceptable for a feature-gated, non-default backend; not a
+  production-concurrency claim.
 - Single hardware configuration; no cross-platform, ARM, or WASM
   measurement performed.
 - The Darwin-lite sweep is a single-generation, four-candidate, in-crate
@@ -609,16 +726,18 @@ following hold on re-measurement at larger scale or against the real
 
 ## Next Research
 
-1. Integrate against `ruvector-snapshot`'s actual serialization format
-   (rather than this crate's synthetic one) and re-measure the same
-   ratios — the concrete blocker flagged throughout this document.
-2. Sweep collection size (10x, 100x) and churn intensity to check whether
-   the ~12%/~5% ratios hold, improve, or degrade at scale, and to find the
+1. ~~Integrate against `ruvector-snapshot`'s actual serialization format~~
+   — **done 2026-09-26**, see the Update section above.
+2. Chunk garbage collection for `CdcLocalStorage`: a real GC pass needs to
+   scan all manifests in a collection to find chunks referenced by none of
+   them before it is safe to delete — not yet designed.
+3. Sweep collection size (10x, 100x) and churn intensity to check whether
+   the ~5-12% ratios hold, improve, or degrade at scale, and to find the
    point where chunking throughput becomes a binding constraint.
-3. Design signed chain roots (mirroring the same open item in
+4. Design signed chain roots (mirroring the same open item in
    `ruvector-retrieval-receipt`/ADR-304) so a checkpoint's provenance
    survives beyond commitment-only tamper-evidence.
-4. A concrete `rvf-manifest`/`rvf-wire` integration prototype, to move the
+5. A concrete `rvf-manifest`/`rvf-wire` integration prototype, to move the
    RVF-implications analysis above from "structurally compatible" to
    "measured."
 
