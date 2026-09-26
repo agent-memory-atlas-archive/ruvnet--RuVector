@@ -13,8 +13,11 @@ cross-arm claim.
 
 - **The encoder did not need to change.** v1 = the v0 training recipe
   (`configs/openjev-small-v0.toml`, unchanged) × 5 seeds, evaluated under a
-  corrected harness configuration. All five seeds pass every ADR-007 tickets
-  gate on validation.
+  corrected harness configuration. All five seeds pass every gate that is
+  evaluable on validation: ECE, urgent, frustration, native p95, CLINC150 OOS
+  AUROC (0.966 ≥ 0.85), and no transfer regression vs base (84.6 % → 84.6–96.2 %).
+  `accuracy_vs_jev` and the ADR-007 §1b vs-Jev tiers need Jev's test rows and
+  are test-only — untouched here.
 - **Urgent / frustration "failures" were a harness regime, not the model.**
   The quoted v0 numbers (urgent 49.3 %, frustration 50.0 %) came from the
   harness default `--shots 8`; v0-plan Step 4/5 specifies `--shots 10000`
@@ -145,7 +148,10 @@ of the card's 16 GB per `nvidia-smi`, so two concurrent runs do not fit);
 ~4.5–5.5 min per seed. Seed 1 is the v0 staged checkpoint
 (`runs/staged-seed1`, onnx sha256 `1d632c31…`); seeds 2–5 were trained at
 this branch's base with the identical config and binary (trainer source
-unchanged since `05066f4`). Transplant parity passed for every seed (cosine
+unchanged since `05066f4`) on byte-identical data: `train.jsonl`
+`9c2bd619…` and `val.jsonl` `a6c911bf…` verified unchanged after the run's
+own `prep`, whose Assertion A report (`runs/v1-art/data-leakage-report.json`)
+shows intersection 0 for every dataset. Transplant parity passed for every seed (cosine
 min ≥ 0.99999999999, 256/256 identical decisions).
 
 | seed | dept | ECE | urgent | urgent AUROC | frustration | p95 ms | transfer |
@@ -245,7 +251,8 @@ Read with these caveats:
 - CLINC150 OOS AUROC comes from the engine's abstain mass on the official
   `oos_val` (100 rows) vs in-scope `val`.
 - Cost of this harness at full data: one public-suite run peaks at 12–38 GB
-  RSS (`trainJson` embeds every training row in one ORT batch) and CLINC150
+  RSS (`Engine::train` makes one `embed()` call for all new rows and
+  `OrtEmbedder::embed` runs that as a single ORT batch — no chunking) and CLINC150
   at 5000 iterations takes ~27 min single-threaded. Running 15 at once was
   OOM-killed; the seeds were re-run 3 at a time. Worth fixing (chunked
   embedding in `train`) before the nightly sandbox (4 CPU / 16 GB) tries it.
@@ -257,6 +264,11 @@ Read with these caveats:
   (unchanged). Tests: `explicit_calibration_replaces_the_positional_carve`,
   `empty_calibration_is_bit_identical_to_plain_train`.
 - `ruvector-typesafe-ffi` / `-wasm`: `trainJson` optional `calibration`.
+- Semantic side effect: a bank JSON given to `importBankJson` that contains
+  `Calibration`-split rows is now honoured by `decide` (those rows become
+  the calibration slice); before, `decide` read only `Train` rows and
+  ignored them. Banks written by the plain `train` path hold no such rows, so
+  their behaviour is unchanged.
 - bench: calibration split by default for tickets (`--no-calibration-split`
   to opt out); `--no-test` on public suites scores the exporter's validation
   slice (`lib/public-val.mjs`, row set verified identical to the trainer's
