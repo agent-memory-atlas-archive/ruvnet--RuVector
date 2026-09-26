@@ -296,3 +296,33 @@ node bench/run.mjs --suite banking77 --arm local --embedder onnx \
   --model-dir ../../../runs/v1-art/seed-2 --model openjev-small-v0 \
   --shots 10000 --engine-options '{"probeIterations":5000}' --no-test
 ```
+
+## Frozen test evaluation (one-time, 2026-09-26)
+
+Claim checkpoint **seed 2** and the shipped configuration (`--shots 10000`,
+`probeIterations 5000`, calibration on the fixture calibration slice) were fixed
+on validation before the test split was scored once. Receipts:
+`npm/packages/typesafe/bench/results/openjev/openjev-v1-seed2-{test,vsjev}-2026-09-26.*`.
+
+| gate (test, n=150) | OpenJev v1 seed 2 | Jev baseline | status |
+|---|---|---|---|
+| department accuracy | 93.3% | 85.3% | PASS (≥ 82.3%) |
+| ECE | 0.0543 | 0.0731 | **FAIL** (≤ 0.05) |
+| urgent accuracy | 92.7% | 61.3% | PASS (≥ 71.3% train majority) |
+| frustration accuracy | 86.0% | 67.3% | PASS (≥ 52.7% train majority) |
+| p95 latency (native) | 10.1 ms | 230.7 ms (network) | PASS |
+| leakage (Assertion B) | 0 / 41,748 | — | PASS |
+
+Paired sequential test vs Jev (α=0.05, λ=0.5, lexical order):
+
+- urgent: **superior** to both Jev references (56 wins / 9 losses vs baseline).
+- frustration: **superior** to both (48 / 20).
+- department: **non-inferior** to both (20 / 8 vs baseline, max wealth 14.05 < 20).
+- Same tiers on the 119-item novel slice (department 91.6% vs 83.2%).
+
+**Verdict against ADR-007 §1:** secondary claim (non-inferior to Jev champion on
+all three) **holds**; primary claim (superior to Jev baseline on all three) is
+**not met** (department not significant at n=150), and the calibration gate
+fails by 0.0043. Per ADR-007 §6, v1 is **not published** to HF. The test split
+has now been used for this claim; v2 must be judged on fresh held-out data
+(see v2 plan), not by re-scoring this split.
