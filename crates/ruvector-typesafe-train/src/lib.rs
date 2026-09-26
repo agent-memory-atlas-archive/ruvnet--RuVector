@@ -7,6 +7,7 @@ pub mod config;
 pub mod data;
 pub mod embed;
 pub mod export;
+pub mod gpu;
 pub mod leakage;
 pub mod loss;
 pub mod model;

@@ -26,6 +26,11 @@ use crate::prep::{heldout_hashes, Sources};
 use crate::sampler::Sampler;
 use step::{head_name, step_loss, StepCtx, H_FRUST, H_URGENT};
 
+struct StepSummary {
+    parts: BTreeMap<&'static str, f32>,
+    texts: usize,
+}
+
 pub struct TrainArgs {
     pub config: Config,
     pub config_sha256: String,
@@ -217,6 +222,7 @@ pub fn run(a: &TrainArgs) -> Result<serde_json::Value> {
         "{}",
         json!({"kind": "eval", "step": 0, "metrics": base_eval})
     )?;
+    crate::gpu::trim(&a.device)?;
     eprintln!(
         "[train] step 0 val selection {:.4} {:?}",
         base_eval.selection, base_eval.components
@@ -228,10 +234,20 @@ pub fn run(a: &TrainArgs) -> Result<serde_json::Value> {
     for s in 0..cfg.train.max_steps {
         let t0 = Instant::now();
         let batch = sampler.next_batch();
-        let out = step_loss(&bert, &heads, &ctx, cfg, &batch)?;
-        let grads = out.loss.backward()?;
         let lr = lr_scale(s, cfg.train.warmup_steps, cfg.train.max_steps);
-        let gnorm = opt.step(&grads, lr, cfg.train.grad_clip)?;
+        // Scoped so the step's graph and gradients are freed before any trim.
+        let (out, gnorm) = {
+            let o = step_loss(&bert, &heads, &ctx, cfg, &batch)?;
+            let grads = o.loss.backward()?;
+            let g = opt.step(&grads, lr, cfg.train.grad_clip)?;
+            (
+                StepSummary {
+                    parts: o.parts,
+                    texts: o.texts,
+                },
+                g,
+            )
+        };
         let dt = t0.elapsed().as_secs_f64();
         let total = out.parts["total"];
         if !total.is_finite() {
@@ -249,13 +265,23 @@ pub fn run(a: &TrainArgs) -> Result<serde_json::Value> {
             "loss": out.parts, "lr_scale": lr, "grad_norm": gnorm, "texts": out.texts, "secs": dt})
         )?;
         if (s + 1) % 25 == 0 {
+            let mem = crate::gpu::used_mib(&a.device);
+            crate::gpu::trim(&a.device)?;
+            let after = crate::gpu::used_mib(&a.device);
+            writeln!(
+                curves,
+                "{}",
+                json!({"kind": "mem", "step": s + 1, "used_mib": mem, "after_trim_mib": after})
+            )?;
             eprintln!(
-                "[train] step {} {} loss {:.4} gnorm {:.3} {:.1} seq/s",
+                "[train] step {} {} loss {:.4} gnorm {:.3} {:.1} seq/s gpu {:?}->{:?} MiB",
                 s + 1,
                 batch.dataset,
                 total,
                 gnorm,
-                texts_seen as f64 / train_secs
+                texts_seen as f64 / train_secs,
+                mem,
+                after
             );
         }
         if (s + 1) % cfg.train.eval_every == 0 || s + 1 == cfg.train.max_steps {
@@ -267,6 +293,7 @@ pub fn run(a: &TrainArgs) -> Result<serde_json::Value> {
                 &val,
                 cfg.train.eval_batch,
             )?;
+            crate::gpu::trim(&a.device)?;
             writeln!(
                 curves,
                 "{}",
