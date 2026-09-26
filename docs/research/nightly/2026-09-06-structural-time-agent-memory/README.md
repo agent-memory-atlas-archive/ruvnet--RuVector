@@ -241,7 +241,7 @@ over that same path; there is no separate hand-wired "production" pipeline
 to special-case. `ruvector-agent-memory` itself currently has no consumer
 crate elsewhere in the workspace (no other crate depends on it) — this is
 the full extent of "integration" available inside the crate's own boundary
-until a downstream consumer exists (see ADR-346, Open Questions).
+until a downstream consumer exists (see ADR-350, Open Questions).
 
 **Acceptance: ACCEPT** (all mandatory gates pass).
 
@@ -458,7 +458,7 @@ recency) **did occur** and is reported as such.
 ## Limitations
 
 - Synthetic corpus only; no real agent-trace validation yet (see Open
-  Questions in ADR-346).
+  Questions in ADR-350).
 - Only 2 of `StructuralMetric`'s 5 channels are exercised (embedding,
   coherence); entropy/graph/prediction-error are honestly zeroed, not
   validated.

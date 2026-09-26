@@ -1,4 +1,4 @@
-# ADR-346: Structural-Time Keyframe Retention for Agent Memory Compaction
+# ADR-350: Structural-Time Keyframe Retention for Agent Memory Compaction
 
 ## Status
 

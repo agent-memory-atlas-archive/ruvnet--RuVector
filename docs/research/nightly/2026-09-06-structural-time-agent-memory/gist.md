@@ -149,5 +149,5 @@ portable-memory-snapshot integration.
 
 - `crates/emergent-time/src/structural_clock.rs`
 - `crates/ruvector-agent-memory/src/compaction.rs`
-- `docs/adr/ADR-346-structural-time-keyframe-agent-memory-retention.md`
+- `docs/adr/ADR-350-structural-time-keyframe-agent-memory-retention.md`
 - `docs/adr/ADR-345-mincut-gated-forgetting.md` (prior related nightly)
