@@ -1,14 +1,12 @@
-# ADR-348: pi.ruv.io — Three Independent 504 Mechanisms, a UTF-8 Crash, and the Unauthenticated Write Path
+# ADR-349: pi.ruv.io — Three Independent 504 Mechanisms, a UTF-8 Crash, and the Unauthenticated Write Path
 
 ## Status
 
 Accepted (code landed). Three items are deliberately **deferred with reasons**
 rather than guessed at — see "Deliberately not decided here".
 
-> **Numbering note.** `ADR-346` is currently claimed by eight different
-> in-flight branches and `ADR-347` by one more; 348 was the first free number
-> at the time of writing. If a concurrent branch also takes 348, renumber at
-> merge.
+> **Numbering note.** Drafted as ADR-348 on 2026-09-19; renumbered to 349 at
+> merge because 347 (PR #989) and 348 (PR #946, TwinKV) were claimed first.
 
 ## Context
 
@@ -380,6 +378,28 @@ months. Every fix in this ADR is inert until a deploy, and the gap itself is a
 risk: the larger it grows, the more a deploy changes at once and the harder a
 regression is to attribute. Deploys are human-authorized; this ADR does not
 perform one.
+
+**6. M4 — the full graph rebuild holds the graph write lock for O(n²) work.
+Not fixed here; this is the dominant 504 signature as of 2026-09-26.**
+`KnowledgeGraph::rebuild_from_batch` computes every pairwise cosine
+(~1.8B pairs at the live 59,758 nodes) and runs with `graph.write()` held at
+two sites:
+
+- `rebuild_graph` in `/v1/pipeline/optimize`, inside the async handler (not
+  `spawn_blocking`), followed by an inline `rebuild_sparsifier`. Triggered by
+  the ENABLED Cloud Scheduler jobs `brain-graph` (`0 */6 * * *`) and
+  `brain-full-optimize` (`0 3 * * *`).
+- The post-hydration rebuild in `create_router`'s background task, which
+  runs in `tokio::spawn` on a worker thread while the server is already
+  serving. Every cold start pays it.
+
+Production logs for 2026-09-23..26 show `Graph rebuilt from batch (ADR-149
+P3)` at exactly 03:00/06:00/18:00 UTC (the scheduler jobs) and at ~hh:12–:18
+on each fresh instance id (cold starts), each followed by 504 bursts. P2 and
+P3 do not touch this path. The natural follow-up is the same shape as P3:
+snapshot the memories, build the new graph off-lock in `spawn_blocking`, swap
+it in under a brief write lock, and bump `index_generation` so an in-flight
+sparsifier build refuses to install.
 
 ## Consequences
 
