@@ -21,7 +21,8 @@ use std::path::PathBuf;
 use crate::audit::Audit;
 use crate::offer::RELIABILITY_FLOOR;
 
-const DEFAULT_IMAGE: &str = "nvidia/cuda:12.4.1-devel-ubuntu22.04@sha256:da6791294b0b04d7e65d87b7451d6f2390b4d36225ab0701ee7dfec5769829f5";
+// ubuntu24.04 (glibc 2.39): ort 2.0.0-rc.13 prebuilt onnxruntime needs glibc >= 2.38.
+const DEFAULT_IMAGE: &str = "nvidia/cuda:12.6.3-devel-ubuntu24.04@sha256:392c0df7b577ecae17a17f6ba7f2009c217bb4422f8431c053ae9af61a8c148a";
 
 #[derive(Parser)]
 #[command(
@@ -76,7 +77,7 @@ struct LaunchArgs {
     num_gpus: u32,
     #[arg(long, default_value_t = 24.0)]
     min_gpu_ram_gb: f64,
-    #[arg(long, default_value_t = 12.4)]
+    #[arg(long, default_value_t = 12.6)]
     min_cuda: f64,
     /// Max planning rate ($/h, including disk storage).
     #[arg(long, default_value_t = 1.0)]
