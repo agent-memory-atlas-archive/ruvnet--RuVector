@@ -121,7 +121,26 @@ The golden files are the contract; change them only together.
 - **`--no-test`** (`run.mjs`, `optimize.mjs`): selection runs. `run.mjs`
   scores validation + transfer only and skips the Jev replay; `optimize.mjs`
   withholds the test rows from the campaign and records test fields as `null`.
-  Incompatible with `--gate` / `--emit-records`.
+  Incompatible with `--gate` / `--emit-records`. On `banking77|clinc150|hwu64`
+  it scores the trainer's validation slice (`lib/public-val.mjs`: the exporter's
+  `sha256(id)` 10 % bucket for Banking77/HWU64, official `val` + `oos_val` for
+  CLINC150, held-out collisions dropped — the row set equals the trainer's
+  `val.jsonl`); the engine trains on the remaining train rows and test rows are
+  only hashed for Assertion B.
+- **Calibration slice** (ADR-007 §4): tickets runs admit the fixture's
+  `calibration` split (37 rows, never a training row for the engine or the
+  trainer) as the engine's calibration slice (`trainJson` `calibration` field →
+  `Engine::train_with_calibration`); temperature and Platt fit on exactly those
+  rows. `--no-calibration-split` restores the engine's positional carve of the
+  train examples (receipts before OpenJev v1).
+- **OpenJev v1 evaluation configuration** (every selection run and the gated
+  run use the same flags; `docs/research/openjev/v1-results.md`):
+  `--shots 10000 --engine-options '{"probeIterations":5000}'` (calibration
+  split on by default). `--shots 10000` is full data, as v0-plan Step 4/5
+  specify; the harness default of 8 shots with the class-balanced probe/logistic
+  erases the urgent/frustration priors. 5000 iterations is where the probe's
+  full-batch GD converges (calibration-slice NLL flat from 5000 to 10000 on
+  bge-small and OpenJev); the engine default of 400 is unchanged.
 - **Per-item records**: local-arm receipts carry `item_records.local.<split>`,
   one `{id, predicted, truth, correct, confidence, abstain?, urgent_score?,
   oos?}` per item (keys of `predicted`/`truth`/`correct`: `department`,
