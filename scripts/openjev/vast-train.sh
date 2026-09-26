@@ -6,9 +6,13 @@
 #   RVGR_ARTIFACT_DIR=/tmp/art OPENJEV_BIN=target-cuda/release/openjev \
 #     scripts/openjev/vast-train.sh --seed 1 --train-args "--max-steps 50 --val-limit 64"
 #
-# Launch (coordinator; the default image is the runner's digest-pinned
-# nvidia/cuda:12.4.1-devel-ubuntu22.04):
-#   ruvector-gpu-runner launch --dry-run --max-usd 5 --max-hours 3 \
+# Launch (coordinator). The image MUST be Ubuntu 24.04-based: ort 2.0.0-rc.13's
+# prebuilt static onnxruntime (used by the engine's native path, hence by
+# `parity`) needs glibc >= 2.38 and GCC 13 libstdc++; the runner's default
+# cuda:12.4.1-devel-ubuntu22.04 (glibc 2.35) fails to link (__isoc23_strtol).
+# CUDA 12.6 needs host driver >= 560.
+#   IMG=nvidia/cuda:12.6.3-devel-ubuntu24.04@sha256:392c0df7b577ecae17a17f6ba7f2009c217bb4422f8431c053ae9af61a8c148a
+#   ruvector-gpu-runner launch --dry-run --max-usd 5 --max-hours 3 --image "$IMG" \
 #     --git-ref feat/openjev-train --git-sha "$(git rev-parse HEAD)" \
 #     --cmd 'bash scripts/openjev/vast-train.sh --seed 1'
 #
@@ -56,6 +60,13 @@ mkdir -p "$ART/logs" "$CACHE"
 log() { echo "[openjev] $(date -u +%FT%TZ) $*"; }
 t0=$(date +%s)
 stamp() { echo "{\"stage\":\"$1\",\"seconds\":$(( $(date +%s) - t0 ))}" >> "$ART/logs/stages.jsonl"; }
+
+# ---- 0. preflight: glibc >= 2.38 (see header) --------------------------------
+GLIBC="$(ldd --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+$' || echo 0)"
+if [ "$(printf '%s\n' 2.38 "$GLIBC" | sort -V | head -1)" != 2.38 ]; then
+  echo "glibc $GLIBC < 2.38: ort's prebuilt onnxruntime will not link; use an Ubuntu 24.04 image (see header)" >&2
+  exit 2
+fi
 
 # ---- 1. toolchain -----------------------------------------------------------
 if [ -z "${OPENJEV_BIN:-}" ]; then
