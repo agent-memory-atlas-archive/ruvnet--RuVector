@@ -158,8 +158,10 @@ min ≥ 0.99999999999, 256/256 identical decisions).
 | **mean ± sd** | **95.1 ± 0.8** | **0.0406 ± 0.0038** | **86.7 ± 3.3** | **0.892 ± 0.024** | **94.3 ± 1.1** | 13.4 ± 3.4 | 89.2 ± 4.2 |
 | gate | ≥ 82.3 (Jev −3 pp); target ≥ 94 | ≤ 0.05 | ≥ 71.3 | — | ≥ 58.7 | ≤ 50 | — |
 
-p95 in this table was measured while other bench jobs loaded the CPU; see the
-idle re-measurement below. Base bge-small under the same configuration:
+p95 in this table was measured while other bench jobs loaded the CPU. Idle
+re-measurement (load < 3, nothing else running) for the claim seed: **p50 7.1
+/ p95 9.4 ms**, and every other metric reproduced bit-for-bit (the engine is
+deterministic); base bge-small under the same conditions: 7.1 / 9.4 ms. Base bge-small under the same configuration:
 dept 84.0, ECE 0.0387, urgent 78.0 (AUROC 0.831), frustration 76.7.
 
 **v0 → v1, seed 1 (validation):**
@@ -170,7 +172,7 @@ dept 84.0, ECE 0.0387, urgent 78.0 (AUROC 0.831), frustration 76.7.
 | ECE | 0.169 FAIL | 0.041 PASS |
 | urgent | 49.3 % FAIL (AUROC 0.525) | 86.7 % PASS (AUROC 0.884) |
 | frustration | 50.0 % FAIL | 93.3 % PASS |
-| p95 | 9.4 ms | see idle re-measurement |
+| p95 | 9.4 ms | 9.4 ms (seed 2, idle; seed 1 17.0 ms under load) |
 
 ### Claim checkpoint (ADR-007 §1d)
 
@@ -212,7 +214,41 @@ Seed-1-only probes along the way (validation):
 
 ## Public suites (Task 5) — validation
 
-PENDING — filled in when the 15 seed runs finish.
+`run.mjs --suite <s> --no-test --shots 10000 --engine-options '{"probeIterations":5000}'`:
+the engine trains on the suite's train rows minus the validation slice and is
+scored on the trainer's validation slice (Banking77 958, CLINC150 2 986
+in-scope + 100 OOS, HWU64 1 918). Base = bge-small-en-v1.5, same command.
+Accuracy is the engine's own head, as ADR-007 §1c requires.
+
+| suite | base bge-small | OpenJev s1 / s2 / s3 / s4 / s5 | OpenJev mean ± sd | Δ vs base |
+|---|---|---|---|---|
+| Banking77 acc | 79.96 % | 89.04 / 88.62 / 88.00 / 88.52 / 89.77 | **88.79 ± 0.66 %** | +8.8 pp |
+| CLINC150 in-scope acc | 92.16 % | 96.89 / 96.58 / 96.55 / 97.09 / 96.62 | **96.74 ± 0.23 %** | +4.6 pp |
+| CLINC150 OOS AUROC | 0.9510 | 0.9641 / 0.9627 / 0.9651 / 0.9705 / 0.9673 | **0.9659 ± 0.0031** | +0.015 (gate ≥ 0.85) |
+| HWU64 acc | 55.89 % | 89.36 / 88.63 / 89.10 / 88.89 / 90.04 | **89.21 ± 0.54 %** | see note |
+
+Read with these caveats:
+
+- **Not comparable to the ADR-007 §1c literature targets** (Banking77 ≥ 92.06,
+  CLINC150 ≥ 95.31 on *test*). These are validation numbers from a head that
+  is still under-converged at 77–150 classes: base bge-small on Banking77 goes
+  60.1 % → 80.0 % from 400 → 5000 iterations (CLINC150 91.0 → 92.2 %), so
+  absolute numbers understate a converged linear probe. The base-vs-OpenJev
+  comparison is apples-to-apples (same command, same budget).
+- **HWU64 runs on the prototype head, not the probe.** `cooking_query` has 4
+  train rows; the engine's every-5th calibration carve leaves 3 < 4
+  (`MIN_EXAMPLES_PER_CLASS`), so `Auto` falls back to nearest-prototype for
+  the whole question and the iteration budget is irrelevant (base identical at
+  400 and 5000). That is why base is 55.9 % and ECE is ~0.43–0.47 for both
+  arms; OpenJev's +33 pp there measures how much better its prototypes are,
+  not a probe-vs-probe gap. HWU64 is reported, not claimed (ADR-007 §1c).
+- CLINC150 OOS AUROC comes from the engine's abstain mass on the official
+  `oos_val` (100 rows) vs in-scope `val`.
+- Cost of this harness at full data: one public-suite run peaks at 12–38 GB
+  RSS (`trainJson` embeds every training row in one ORT batch) and CLINC150
+  at 5000 iterations takes ~27 min single-threaded. Running 15 at once was
+  OOM-killed; the seeds were re-run 3 at a time. Worth fixing (chunked
+  embedding in `train`) before the nightly sandbox (4 CPU / 16 GB) tries it.
 
 ## Engine / harness changes in this branch
 
