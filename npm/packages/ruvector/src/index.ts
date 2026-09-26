@@ -28,8 +28,20 @@ if (rvfRequested) {
   // Explicit rvf backend requested - fail hard if not available
   try {
     implementation = require('@ruvector/rvf');
+    // @ruvector/rvf is a DIFFERENT module with a different surface: it exports
+    // RvfDatabase, never VectorDb. Accepting it unchecked produced
+    // "implementation.VectorDb is not a constructor" at first use, far from
+    // the real cause. Fail here, with the reason, instead.
+    if (typeof implementation?.VectorDb !== 'function') {
+      throw new Error(
+        '@ruvector/rvf does not provide a VectorDb class (it exports RvfDatabase).\n' +
+        '  It cannot back the VectorDB API. Install @ruvector/core instead:\n' +
+        '    npm install @ruvector/core'
+      );
+    }
     implementationType = 'rvf';
   } catch (e: any) {
+    if (e instanceof Error && e.message.includes('does not provide a VectorDb')) throw e;
     throw new Error(
       '@ruvector/rvf is not installed.\n' +
       '  Run: npm install @ruvector/rvf\n' +
@@ -47,9 +59,15 @@ if (rvfRequested) {
       throw new Error('Native module loaded but VectorDb class not found');
     }
   } catch (e: any) {
-    // Try rvf (persistent store) as second fallback
+    // Try rvf (persistent store) as second fallback. It only qualifies if it
+    // actually exposes VectorDb -- today it does not, so this correctly falls
+    // through to the stub rather than handing back an unusable module.
     try {
-      implementation = require('@ruvector/rvf');
+      const rvf = require('@ruvector/rvf');
+      if (typeof rvf?.VectorDb !== 'function') {
+        throw new Error('@ruvector/rvf exports no VectorDb class (it provides RvfDatabase)');
+      }
+      implementation = rvf;
       implementationType = 'rvf';
     } catch (rvfErr: any) {
       // Graceful fallback - don't crash, just warn
@@ -57,16 +75,26 @@ if (rvfRequested) {
       console.warn('[RuVector] RVF module not available:', rvfErr.message);
       console.warn('[RuVector] Vector operations will be limited. Install @ruvector/core or @ruvector/rvf for full functionality.');
 
-      // Create a stub implementation that provides basic functionality
+      // Stub of last resort. It deliberately reports its own emptiness
+      // truthfully (len 0, isEmpty true, search []) rather than pretending a
+      // write succeeded: `insert` used to return a plausible "stub-id-..."
+      // for data it silently discarded, so a caller storing vectors saw
+      // success and lost every one of them. Writes now throw.
+      const unavailable = () => new Error(
+        '[RuVector] No vector backend is available: @ruvector/core failed to load ' +
+        'and @ruvector/rvf cannot substitute for it.\n' +
+        '  Install the native module: npm install @ruvector/core\n' +
+        '  Reads return empty; writes are refused so data is not silently dropped.'
+      );
       implementation = {
         VectorDb: class StubVectorDb {
           constructor() {
             console.warn('[RuVector] Using stub VectorDb - install @ruvector/core for native performance');
           }
-          async insert() { return 'stub-id-' + Date.now(); }
-          async insertBatch(entries: any[]) { return entries.map(() => 'stub-id-' + Date.now()); }
+          async insert(): Promise<never> { throw unavailable(); }
+          async insertBatch(_entries: any[]): Promise<never> { throw unavailable(); }
+          async delete(): Promise<never> { throw unavailable(); }
           async search() { return []; }
-          async delete() { return true; }
           async get() { return null; }
           async len() { return 0; }
           async isEmpty() { return true; }
@@ -142,43 +170,63 @@ function normalizeMetric(metric: string | undefined): string | undefined {
   }
 }
 
+/** Options the public `VectorDB` constructor accepts (canonical names + aliases). */
+export interface VectorDbConstructorOptions {
+  dimensions?: number; dimension?: number;
+  storagePath?: string; path?: string;
+  distanceMetric?: string; metric?: string;
+  hnswConfig?: any; hnsw?: { m?: number; efConstruction?: number; efSearch?: number; maxElements?: number };
+}
+
+const HNSW_DEFAULTS = { m: 32, efConstruction: 200, efSearch: 100, maxElements: 10_000_000 };
+
+/**
+ * Resolve public constructor options (and their aliases) into exactly what the
+ * native N-API binding accepts. Exported and pure so the alias handling is
+ * unit-testable without a native binding.
+ *
+ * `DbOptions` in types.ts documented `hnsw: { m, efConstruction, efSearch }` and
+ * `path`, but the wrapper only ever read `hnswConfig` and `storagePath` — so a
+ * caller who followed the published types had their HNSW settings silently
+ * dropped and got the defaults (measured 2026-09-21: `hnsw.efSearch` had no
+ * effect at all). Both spellings are honoured; the canonical name wins when a
+ * caller passes both, and a partial `hnsw` is merged over the defaults so
+ * `{ hnsw: { efSearch: 200 } }` changes exactly that and nothing else.
+ */
+export function resolveVectorDbOptions(options: VectorDbConstructorOptions): {
+  dimensions: number; storagePath?: string; distanceMetric?: string; hnswConfig: any;
+} {
+  const dimensions = options.dimensions ?? options.dimension;
+  if (typeof dimensions !== 'number' || !Number.isInteger(dimensions) || dimensions <= 0) {
+    throw new Error('Missing or invalid `dimensions` (the singular `dimension` alias is also accepted)');
+  }
+  const out: { dimensions: number; storagePath?: string; distanceMetric?: string; hnswConfig: any } = {
+    dimensions,
+    storagePath: options.storagePath ?? options.path,
+    // The N-API binding maps an omitted hnswConfig to `None`, which selects
+    // FlatIndex and unintentionally overrides ruvector-core's HNSW default, so
+    // the documented defaults are always passed explicitly.
+    hnswConfig: options.hnswConfig !== undefined
+      ? options.hnswConfig
+      : options.hnsw !== undefined
+        ? { ...HNSW_DEFAULTS, ...options.hnsw }
+        : HNSW_DEFAULTS,
+  };
+  const distanceMetric = normalizeMetric(options.distanceMetric ?? options.metric);
+  if (distanceMetric !== undefined) out.distanceMetric = distanceMetric;
+  return out;
+}
+
 /**
  * Wrapper class that automatically handles metadata JSON conversion
  */
 class VectorDBWrapper {
   private db: any;
 
-  constructor(options: { dimensions?: number; dimension?: number; storagePath?: string; distanceMetric?: string; metric?: string; hnswConfig?: any }) {
-    // Accept both `distanceMetric` (canonical) and `metric` (CLI shorthand).
-    // Normalize to the PascalCase enum variant the native binding expects.
-    const distanceMetric = normalizeMetric(options.distanceMetric ?? (options as any).metric);
-    const dimensions = options.dimensions ?? options.dimension;
-    if (typeof dimensions !== 'number' || !Number.isInteger(dimensions) || dimensions <= 0) {
-      throw new Error('Missing or invalid `dimensions` (the singular `dimension` alias is also accepted)');
-    }
-    const nativeOptions: any = {
-      // The native N-API contract is plural even when callers use the public
-      // singular alias. Keeping this mapping here prevents CLI/API drift.
-      dimensions,
-      storagePath: options.storagePath,
-      // The N-API binding maps an omitted hnswConfig to `None`, which selects
-      // FlatIndex and unintentionally overrides ruvector-core's HNSW default.
-      // Pass the documented defaults explicitly so the high-level VectorDB
-      // remains an ANN database unless callers deliberately provide another
-      // HNSW configuration.
-      hnswConfig: options.hnswConfig === undefined
-        ? {
-            m: 32,
-            efConstruction: 200,
-            efSearch: 100,
-            maxElements: 10_000_000,
-          }
-        : options.hnswConfig,
-    };
-    if (distanceMetric !== undefined) {
-      nativeOptions.distanceMetric = distanceMetric;
-    }
-    this.db = new implementation.VectorDb(nativeOptions);
+  constructor(options: VectorDbConstructorOptions) {
+    // All alias handling lives in `resolveVectorDbOptions` (exported, pure,
+    // unit-tested) so the constructor and the CLI cannot drift apart again.
+    this.db = new implementation.VectorDb(resolveVectorDbOptions(options));
   }
 
   /**
