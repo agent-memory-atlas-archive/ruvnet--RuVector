@@ -93,15 +93,21 @@ pub fn step_loss(
         .iter()
         .map(|(i, _)| ctx.tokens[*i].as_slice())
         .collect();
-    for l in &b.desc_labels {
-        let t = ctx
-            .desc_tokens
-            .get(&(ds.to_string(), l.clone()))
-            .with_context(|| format!("no description for {ds}/{l}"))?;
-        seqs.push(t.as_slice());
+    // Descriptions excluded by the leakage check (equal to a held-out text) are
+    // absent from `desc_tokens`; those labels simply get no extra positive.
+    let descs: Vec<&String> = b
+        .desc_labels
+        .iter()
+        .filter(|l| {
+            ctx.desc_tokens
+                .contains_key(&(ds.to_string(), (*l).clone()))
+        })
+        .collect();
+    for l in &descs {
+        seqs.push(ctx.desc_tokens[&(ds.to_string(), (*l).clone())].as_slice());
     }
     seqs.extend(b.oos_rows.iter().map(|i| ctx.tokens[*i].as_slice()));
-    let (n_rows, n_desc, n_oos) = (b.rows.len(), b.desc_labels.len(), b.oos_rows.len());
+    let (n_rows, n_desc, n_oos) = (b.rows.len(), descs.len(), b.oos_rows.len());
     let batch = pad_rows(&seqs, PAD_ID, &bert.device)?;
     let emb = bert.embed(&batch.ids, &batch.types, &batch.mask)?;
     let mut parts = BTreeMap::new();
@@ -111,7 +117,7 @@ pub fn step_loss(
         .rows
         .iter()
         .map(|(_, l)| l)
-        .chain(b.desc_labels.iter())
+        .chain(descs.iter().copied())
         .map(|l| lidx[l] as u32)
         .collect();
     let mut total = match supcon(

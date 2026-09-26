@@ -43,6 +43,9 @@ fn prep_counts_and_planted_collision_aborts_train() {
     let tickets_val = out.val.iter().filter(|r| r.dataset == TICKETS).count();
     assert_eq!((tickets_train, tickets_val), (136, 150));
     assert_eq!(out.report.total_intersection(), 0);
+    // 12 humanised intent names equal public test utterances (e.g. CLINC150 "goodbye").
+    let dropped: usize = out.report.dropped_descriptions.values().map(Vec::len).sum();
+    assert_eq!(dropped, 12, "{:?}", out.report.dropped_descriptions);
 
     // Plant one frozen *test* ticket (case/punctuation changed) into train.jsonl.
     let fx: serde_json::Value =

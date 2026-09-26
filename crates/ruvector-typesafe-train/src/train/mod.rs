@@ -17,7 +17,7 @@ use serde_json::json;
 use crate::config::Config;
 use crate::data::{read_hashes, write_hashes, DataDir, Row, TICKETS};
 use crate::embed::{load_tokenizer, pretokenize};
-use crate::leakage::{assert_no_leakage, LeakageReport};
+use crate::leakage::{assert_no_leakage, colliding_descriptions, LeakageReport};
 use crate::model::{frozen_view, load_encoder, BertConfig, Heads};
 use crate::norm::{sha256_hex, sha256_norm};
 use crate::optim::{lr_scale, AdamW};
@@ -71,8 +71,23 @@ pub fn prep_check(a: &TrainArgs) -> Result<PrepCheck> {
     if exported.exists() {
         heldout.extend(read_hashes(&exported)?);
     }
-    let leakage = assert_no_leakage(&data.train, &data.val, &heldout, &counts, &BTreeMap::new())
+    // Carry prep's dropped-duplicate counts into this run's report (model card).
+    let mut dropped: BTreeMap<String, usize> = BTreeMap::new();
+    let prep_report = a.data.join("leakage-report.json");
+    if prep_report.exists() {
+        let v: serde_json::Value = serde_json::from_slice(&fs::read(&prep_report)?)?;
+        if let Some(per) = v["per_dataset"].as_object() {
+            for (ds, d) in per {
+                dropped.insert(
+                    ds.clone(),
+                    d["dropped_duplicates"].as_u64().unwrap_or(0) as usize,
+                );
+            }
+        }
+    }
+    let mut leakage = assert_no_leakage(&data.train, &data.val, &heldout, &counts, &dropped)
         .map_err(anyhow::Error::new)?;
+    leakage.dropped_descriptions = colliding_descriptions(&data.labels, &heldout);
     let tok = load_tokenizer(&a.tokenizer, 512)?;
     let active: HashSet<&str> = a.config.active().into_iter().collect();
     let texts: Vec<&str> = data
@@ -134,10 +149,22 @@ pub fn run(a: &TrainArgs) -> Result<serde_json::Value> {
         .cloned()
         .collect();
 
-    // Assertion B input: every text that produced a gradient (rows + label descriptions).
+    // Label descriptions that equal a held-out text are never trained on.
+    let banned = |ds: &str, label: &str| {
+        pc.leakage
+            .dropped_descriptions
+            .get(ds)
+            .is_some_and(|v| v.iter().any(|l| l == label))
+    };
+    // Assertion B input: every text that produced a gradient (rows + the label
+    // descriptions actually used as SupCon positives).
     let mut grad_texts: Vec<String> = train.iter().map(|r| sha256_norm(&r.text)).collect();
     for ds in &active {
-        grad_texts.extend(pc.data.labels[*ds].values().map(|d| sha256_norm(d)));
+        for (label, d) in &pc.data.labels[*ds] {
+            if !banned(ds, label) {
+                grad_texts.push(sha256_norm(d));
+            }
+        }
     }
     let n_hashes = write_hashes(&a.out.join("train-text-hashes.txt"), grad_texts)?;
 
@@ -159,7 +186,9 @@ pub fn run(a: &TrainArgs) -> Result<serde_json::Value> {
         let keys: Vec<&String> = labels.keys().collect();
         let dt: Vec<&str> = labels.values().map(|s| s.as_str()).collect();
         for (k, t) in keys.into_iter().zip(pretokenize(&tok, &dt)?) {
-            desc_tokens.insert((ds.to_string(), k.clone()), t);
+            if !banned(ds, k) {
+                desc_tokens.insert((ds.to_string(), k.clone()), t);
+            }
         }
     }
     let (urgent_w, frust_w) = StepCtx::class_weights(&train);

@@ -27,6 +27,10 @@ pub struct DatasetLeak {
 pub struct LeakageReport {
     pub heldout_hashes: usize,
     pub per_dataset: BTreeMap<String, DatasetLeak>,
+    /// Label-description texts (SupCon extra positives) that equal a held-out
+    /// text; they are excluded from training, never used (dataset -> labels).
+    #[serde(default)]
+    pub dropped_descriptions: BTreeMap<String, Vec<String>>,
     /// Up to 10 offending (dataset, id) pairs, for the abort message.
     pub examples: Vec<(String, String)>,
 }
@@ -70,6 +74,24 @@ pub fn drop_heldout(
         })
         .collect();
     (kept, dropped)
+}
+
+/// Label descriptions whose normalized hash is held out. Found on the real data:
+/// 12 humanised intent names (e.g. CLINC150 `goodbye`, `what is your name`)
+/// are verbatim public *test* utterances, so they must never produce gradients.
+pub fn colliding_descriptions(
+    labels: &crate::data::Labels,
+    heldout: &HashSet<String>,
+) -> BTreeMap<String, Vec<String>> {
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (ds, m) in labels {
+        for (label, desc) in m {
+            if heldout.contains(&sha256_norm(desc)) {
+                out.entry(ds.clone()).or_default().push(label.clone());
+            }
+        }
+    }
+    out
 }
 
 /// Assertion A. `heldout_by_dataset` is only used for per-dataset counts; the
@@ -152,6 +174,22 @@ mod tests {
             &BTreeMap::new(),
         );
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn description_equal_to_a_test_text_is_reported() {
+        let heldout: HashSet<String> = [sha256_norm("Goodbye!")].into();
+        let mut labels = crate::data::Labels::new();
+        labels.insert(
+            "clinc150".into(),
+            [
+                ("goodbye".to_string(), "goodbye".to_string()),
+                ("greeting".to_string(), "greeting".to_string()),
+            ]
+            .into(),
+        );
+        let hit = colliding_descriptions(&labels, &heldout);
+        assert_eq!(hit["clinc150"], vec!["goodbye".to_string()]);
     }
 
     #[test]

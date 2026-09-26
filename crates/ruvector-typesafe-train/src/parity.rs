@@ -33,9 +33,9 @@ pub struct ParityReport {
     pub onnx_sha256: String,
     pub probes: usize,
     pub threshold: f32,
-    pub cosine_min: f32,
+    pub cosine_min: f64,
     pub cosine_mean: f64,
-    pub cosine_p01: f32,
+    pub cosine_p01: f64,
     pub below_threshold: usize,
     pub decisions_compared: usize,
     pub decisions_identical: usize,
@@ -107,14 +107,14 @@ fn manifest_for(onnx_bytes: &[u8], tok_bytes: &[u8], max_tokens: usize) -> Model
     }
 }
 
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
+fn cosine(a: &[f32], b: &[f32]) -> f64 {
     let (mut d, mut na, mut nb) = (0f64, 0f64, 0f64);
     for (x, y) in a.iter().zip(b) {
         d += (*x as f64) * (*y as f64);
         na += (*x as f64).powi(2);
         nb += (*y as f64).powi(2);
     }
-    (d / (na.sqrt() * nb.sqrt()).max(1e-24)) as f32
+    d / (na.sqrt() * nb.sqrt()).max(1e-24)
 }
 
 fn department_decisions<E: Embedder>(
@@ -188,7 +188,7 @@ pub fn run(a: &ParityArgs, device: &Device) -> Result<ParityReport> {
     }
     let mut sorted = cos.clone();
     sorted.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
-    let below = cos.iter().filter(|&&c| c < a.threshold).count();
+    let below = cos.iter().filter(|&&c| c < f64::from(a.threshold)).count();
     let (mut compared, mut identical) = (0, 0);
     if let Some(d) = data.as_ref() {
         let n = texts.len().min(256);
@@ -204,7 +204,7 @@ pub fn run(a: &ParityArgs, device: &Device) -> Result<ParityReport> {
         probes: cos.len(),
         threshold: a.threshold,
         cosine_min: sorted.first().copied().unwrap_or(0.0),
-        cosine_mean: cos.iter().map(|&c| c as f64).sum::<f64>() / cos.len().max(1) as f64,
+        cosine_mean: cos.iter().sum::<f64>() / cos.len().max(1) as f64,
         cosine_p01: sorted.get(sorted.len() / 100).copied().unwrap_or(0.0),
         below_threshold: below,
         decisions_compared: compared,

@@ -68,6 +68,8 @@ fn build() -> (Vec<Row>, StepCtx, Config) {
         rows.push(r);
         tokens.push(vec![1, 60, 2]);
     }
+    // One label without a description (as after the leakage exclusion).
+    desc_tokens.remove(&(TICKETS.to_string(), "L0".to_string()));
     let (urgent_w, frust_w) = StepCtx::class_weights(&rows);
     let ctx = StepCtx {
         rows: rows.clone(),

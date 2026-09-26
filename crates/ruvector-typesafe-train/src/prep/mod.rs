@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use serde_json::json;
 
 use crate::data::{write_hashes, write_jsonl, Labels, Row, TICKETS};
-use crate::leakage::{assert_no_leakage, drop_heldout, LeakageReport};
+use crate::leakage::{assert_no_leakage, colliding_descriptions, drop_heldout, LeakageReport};
 use crate::norm::{sha256_hex, sha256_norm};
 use crate::pins::{self, ensure};
 
@@ -107,8 +107,9 @@ pub fn run(src: &Sources, out: &Path) -> Result<PrepOutput> {
     for (k, v) in dropped_val {
         *dropped.entry(k).or_default() += v;
     }
-    let report = assert_no_leakage(&train, &val, &heldout, &heldout_counts, &dropped)
+    let mut report = assert_no_leakage(&train, &val, &heldout, &heldout_counts, &dropped)
         .map_err(anyhow::Error::new)?;
+    report.dropped_descriptions = colliding_descriptions(&labels, &heldout);
 
     fs::create_dir_all(out).with_context(|| format!("mkdir {}", out.display()))?;
     write_jsonl(&out.join("train.jsonl"), &train)?;
