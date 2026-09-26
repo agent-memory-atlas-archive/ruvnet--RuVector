@@ -2,6 +2,7 @@
 
 use crate::auth::AuthenticatedContributor;
 use crate::graph::cosine_similarity;
+use crate::text::truncate_at_char_boundary;
 use crate::types::{
     AddEvidenceRequest, AppState, BatchInjectRequest, BatchInjectResponse, BetaParams, BrainMemory,
     ChallengeResponse, ConsciousnessComputeRequest, ConsciousnessComputeResponse,
@@ -1150,10 +1151,11 @@ pub fn run_enhanced_training_cycle(state: &AppState, force_full: bool) -> Enhanc
     for mem in discovery_memories.iter().take(5) {
         // Truncate content to first meaningful sentence
         let content = &mem.content;
-        let finding = if let Some(pos) = content[..content.len().min(300)].find(". ") {
+        let head = truncate_at_char_boundary(content, 300);
+        let finding = if let Some(pos) = head.find(". ") {
             &content[..pos + 1]
         } else {
-            &content[..content.len().min(200)]
+            truncate_at_char_boundary(content, 200)
         };
         findings.push(format!("{}: {}", mem.title, finding));
     }
@@ -1201,11 +1203,7 @@ pub fn run_enhanced_training_cycle(state: &AppState, force_full: bool) -> Enhanc
     let discovery_title = if !raw_inferences.is_empty() {
         // Use first inference as the basis for the title
         let first = &raw_inferences[0];
-        let short = if first.len() > 80 {
-            &first[..80]
-        } else {
-            first
-        };
+        let short = truncate_at_char_boundary(first, 80);
         format!("Discovery: {}", short)
     } else if curiosity_triggered {
         "Curiosity-Driven Knowledge Gap Analysis".to_string()
@@ -1919,9 +1917,13 @@ async fn search_memories(
     let expanded_tokens = expand_synonyms(&query_tokens);
 
     // ── Graph PPR scores: blend cosine+PageRank from knowledge graph ──
-    // Use write lock briefly: ranked_search may lazily rebuild CSR cache
+    // Read lock: the CSR cache has its own interior lock, so `ranked_search`
+    // can rebuild it lazily without excluding every other reader. Before this,
+    // every inject marked the CSR dirty and the next search took a WRITE lock
+    // on the whole graph for the duration of a full rebuild (~1.2M edges in
+    // production), serialising all traffic behind it.
     let graph_scores: std::collections::HashMap<Uuid, f64> = {
-        let mut g = state.graph.write();
+        let g = state.graph.read();
         if g.node_count() >= 3 {
             g.ranked_search(&query_embedding, limit * 3)
                 .into_iter()
@@ -2420,7 +2422,7 @@ async fn delete_memory(
 
     let deleted = state
         .store
-        .delete_memory(&id, &contributor.pseudonym)
+        .delete_memory_as(&id, &contributor.pseudonym, contributor.is_system)
         .await
         .map_err(|e| match e {
             crate::store::StoreError::Forbidden(_) => (StatusCode::FORBIDDEN, e.to_string()),
@@ -3801,11 +3803,24 @@ async fn process_inject(state: &AppState, req: InjectRequest) -> Result<InjectRe
 }
 
 /// POST /v1/pipeline/inject — inject a single item into the brain pipeline
+///
+/// Requires a contributor API key. Before this extractor was added the
+/// endpoint was writable by anyone on the internet: the Cloud Run service
+/// grants `roles/run.invoker` to `allUsers`, and `READ_ONLY` is unset in
+/// production, so `check_read_only` alone gated nothing.
 async fn pipeline_inject(
     State(state): State<AppState>,
+    contributor: AuthenticatedContributor,
     Json(req): Json<InjectRequest>,
 ) -> Result<(StatusCode, Json<InjectResponse>), (StatusCode, String)> {
     check_read_only(&state)?;
+
+    if !state.rate_limiter.check_write(&contributor.pseudonym) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "Write rate limit exceeded".into(),
+        ));
+    }
 
     match process_inject(&state, req).await {
         Ok(resp) => Ok((StatusCode::CREATED, Json(resp))),
@@ -3820,11 +3835,23 @@ async fn pipeline_inject(
 }
 
 /// POST /v1/pipeline/inject/batch — inject up to 100 items
+///
+/// Requires a contributor API key (see `pipeline_inject`). The live
+/// `brain-pubmed-daily` Cloud Scheduler job already sends a Bearer token to
+/// this path, so adding the extractor does not change its behaviour.
 async fn pipeline_inject_batch(
     State(state): State<AppState>,
+    contributor: AuthenticatedContributor,
     Json(req): Json<BatchInjectRequest>,
 ) -> Result<Json<BatchInjectResponse>, (StatusCode, String)> {
     check_read_only(&state)?;
+
+    if !state.rate_limiter.check_write(&contributor.pseudonym) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "Write rate limit exceeded".into(),
+        ));
+    }
 
     if req.items.len() > 100 {
         return Err((
@@ -3874,7 +3901,26 @@ async fn pipeline_inject_batch(
 }
 
 /// POST /v1/pipeline/pubsub — receive Cloud Pub/Sub push messages.
-/// No Bearer auth required (Cloud Run validates Pub/Sub OIDC tokens automatically).
+///
+/// # UNAUTHENTICATED — do not trust the previous comment here
+///
+/// This used to claim "Cloud Run validates Pub/Sub OIDC tokens
+/// automatically". That is **false for this service**. Cloud Run only
+/// validates the OIDC token when the service *requires* authentication;
+/// `ruvbrain` grants `roles/run.invoker` to `allUsers` (it serves the public
+/// pi.ruv.io page from the same service), so every request reaches the
+/// handler and the token is never checked by anything.
+///
+/// The live `brain-inject-push` subscription *does* attach an OIDC token for
+/// `ruvbrain-scheduler@ruv-dev.iam.gserviceaccount.com`, so the fix is to
+/// verify that token here (issuer, audience, signature against Google's
+/// JWKS, and the expected service-account email). Deliberately NOT done in
+/// this change: it needs a new dependency and a decision on the expected
+/// audience, and it cannot be exercised against a real token from a test.
+///
+/// Note that the `AuthenticatedContributor` extractor is the **wrong**
+/// mechanism here — a Google OIDC JWT is well over the extractor's 256-byte
+/// ceiling, so applying it would reject every legitimate push.
 async fn pipeline_pubsub_push(
     State(state): State<AppState>,
     Json(push): Json<PubSubPushMessage>,
@@ -6859,6 +6905,72 @@ async fn notify_help(
     }
 }
 
+/// Render the per-memory `<tr>` rows of the daily digest email.
+///
+/// Extracted from `notify_digest` so the truncation behaviour that panicked
+/// production (byte-slicing `title`/`content` at a fixed budget) is directly
+/// testable without an `AppState`, a notifier, or a live Resend key.
+pub fn format_digest_rows<M: std::borrow::Borrow<crate::types::BrainMemory>>(
+    memories: &[M],
+) -> String {
+    fn category_emoji(cat: &crate::types::BrainCategory) -> &'static str {
+        use crate::types::BrainCategory::*;
+        match cat {
+            Architecture => "🏗️",
+            Pattern => "🔄",
+            Solution => "💡",
+            Security => "🔒",
+            Convention => "📐",
+            Performance => "⚡",
+            Tooling => "🔧",
+            Debug => "🐛",
+            _ => "📝",
+        }
+    }
+
+    let mut rows = String::new();
+    for m in memories {
+        let m = m.borrow();
+        let title = truncate_at_char_boundary(&m.title, 120);
+        // Take first ~250 bytes but break at sentence boundary
+        let content_raw = truncate_at_char_boundary(&m.content, 250);
+        let content = match content_raw.rfind(". ") {
+            Some(pos) if pos > 80 => &content_raw[..pos + 1],
+            _ => content_raw,
+        };
+        let emoji = category_emoji(&m.category);
+        let tags_html: Vec<_> = m
+            .tags
+            .iter()
+            .filter(|t| !t.contains("auto-generated") && !t.contains("training-cycle"))
+            .take(3)
+            .map(|t| {
+                format!("<span style=\"display:inline-block;background:#1a1a3a;color:#4fc3f7;padding:2px 8px;border-radius:4px;font-size:11px;margin:2px;\">{}</span>", t)
+            })
+            .collect();
+        rows.push_str(&format!(
+            r#"<tr style="border-bottom:1px solid #1a1a3a;">
+<td style="padding:14px 0;">
+<div style="margin-bottom:4px;">{emoji} <strong style="color:#e0e0ff;font-size:14px;">{title}</strong></div>
+<div style="margin-bottom:6px;">{tags}</div>
+<div style="color:#aaa;font-size:12px;line-height:1.5;">{content}</div>
+</td></tr>"#,
+            emoji = emoji,
+            title = title,
+            tags = if tags_html.is_empty() {
+                format!(
+                    "<span style=\"color:#666;font-size:11px;\">{:?}</span>",
+                    m.category
+                )
+            } else {
+                tags_html.join("")
+            },
+            content = content,
+        ));
+    }
+    rows
+}
+
 /// POST /v1/notify/digest — send daily discovery digest email
 /// Triggered by Cloud Scheduler after research jobs complete.
 /// Body: { "topic": "optional focus topic", "limit": 10, "hours": 24 }
@@ -6949,62 +7061,7 @@ async fn notify_digest(
     }
 
     // Build HTML rows — human-readable format
-    let mut rows = String::new();
-    let category_emoji = |cat: &crate::types::BrainCategory| -> &str {
-        use crate::types::BrainCategory::*;
-        match cat {
-            Architecture => "🏗️",
-            Pattern => "🔄",
-            Solution => "💡",
-            Security => "🔒",
-            Convention => "📐",
-            Performance => "⚡",
-            Tooling => "🔧",
-            Debug => "🐛",
-            _ => "📝",
-        }
-    };
-
-    for (i, m) in filtered.iter().enumerate() {
-        let title = if m.title.len() > 120 {
-            &m.title[..120]
-        } else {
-            &m.title
-        };
-        // Take first ~250 chars but break at sentence boundary
-        let content_raw = if m.content.len() > 250 {
-            &m.content[..250]
-        } else {
-            &m.content
-        };
-        let content = match content_raw.rfind(". ") {
-            Some(pos) if pos > 80 => &content_raw[..pos + 1],
-            _ => content_raw,
-        };
-        let emoji = category_emoji(&m.category);
-        let tags_html: Vec<_> = m.tags.iter()
-            .filter(|t| !t.contains("auto-generated") && !t.contains("training-cycle"))
-            .take(3)
-            .map(|t| {
-                format!("<span style=\"display:inline-block;background:#1a1a3a;color:#4fc3f7;padding:2px 8px;border-radius:4px;font-size:11px;margin:2px;\">{}</span>", t)
-            }).collect();
-        rows.push_str(&format!(
-            r#"<tr style="border-bottom:1px solid #1a1a3a;">
-<td style="padding:14px 0;">
-<div style="margin-bottom:4px;">{emoji} <strong style="color:#e0e0ff;font-size:14px;">{title}</strong></div>
-<div style="margin-bottom:6px;">{tags}</div>
-<div style="color:#aaa;font-size:12px;line-height:1.5;">{content}</div>
-</td></tr>"#,
-            emoji = emoji,
-            title = title,
-            tags = if tags_html.is_empty() {
-                format!("<span style=\"color:#666;font-size:11px;\">{:?}</span>", m.category)
-            } else {
-                tags_html.join("")
-            },
-            content = content,
-        ));
-    }
+    let rows = format_digest_rows(&filtered);
 
     let topic_line = topic.map_or(String::new(), |t| {
         format!("<p style=\"color:#888;font-size:12px;\">Focus: <span style=\"background:#1a1a3a;color:#7fdbca;padding:2px 6px;border-radius:4px;\">{}</span></p>", t)
@@ -7332,7 +7389,7 @@ async fn google_chat_handler(
     tracing::info!(
         "Google Chat raw payload ({} bytes): {}...",
         body.len(),
-        &raw_str[..raw_str.len().min(300)]
+        truncate_at_char_boundary(&raw_str, 300)
     );
 
     // Parse as generic JSON first to handle both Add-on and legacy formats
@@ -7342,7 +7399,7 @@ async fn google_chat_handler(
             tracing::warn!(
                 "Failed to parse Chat JSON: {}. Raw: {}...",
                 err,
-                &raw_str[..raw_str.len().min(300)]
+                truncate_at_char_boundary(&raw_str, 300)
             );
             return Json(chat_card(
                 "Error",
@@ -7548,11 +7605,7 @@ async fn google_chat_handler(
 
             let mut result_text = String::new();
             for (i, (title, content, cat, score)) in top.iter().enumerate() {
-                let truncated = if content.len() > 150 {
-                    &content[..150]
-                } else {
-                    content.as_str()
-                };
+                let truncated = truncate_at_char_boundary(content, 150);
                 result_text.push_str(&format!(
                     "<b>{}.</b> {} <i>({})</i>\n{}\n<font color=\"#888888\">score: {:.3}</font>\n\n",
                     i + 1, title, cat, truncated, score
@@ -7623,11 +7676,7 @@ async fn google_chat_handler(
 
             let mut text = String::new();
             for (i, m) in recent.iter().enumerate() {
-                let truncated = if m.content.len() > 100 {
-                    &m.content[..100]
-                } else {
-                    &m.content
-                };
+                let truncated = truncate_at_char_boundary(&m.content, 100);
                 text.push_str(&format!(
                     "<b>{}.</b> {} <i>({})</i>\n{}\n\n",
                     i + 1,
@@ -7671,7 +7720,7 @@ async fn google_chat_handler(
             match gemini_chat_respond(&state, text, user_name).await {
                 Ok(response) => Json(chat_card(
                     "Pi Brain",
-                    &format!("Re: {}", &text[..text.len().min(30)]),
+                    &format!("Re: {}", truncate_at_char_boundary(text, 30)),
                     vec![chat_text_section(&response)],
                 )),
                 Err(e) => {
@@ -7703,11 +7752,7 @@ async fn google_chat_handler(
 
                     let mut result_text = format!("Results for \"<i>{}</i>\":\n\n", query);
                     for (i, (title, content, cat, _score)) in top.iter().enumerate() {
-                        let truncated = if content.len() > 120 {
-                            &content[..120]
-                        } else {
-                            content.as_str()
-                        };
+                        let truncated = truncate_at_char_boundary(content, 120);
                         result_text.push_str(&format!(
                             "<b>{}.</b> {} <i>({})</i>\n{}\n\n",
                             i + 1,
@@ -7767,7 +7812,7 @@ async fn gemini_chat_respond(
         "No relevant memories found for this query.".to_string()
     } else {
         top_results.iter().enumerate().map(|(i, (m, score))| {
-            let content_preview = if m.content.len() > 600 { &m.content[..600] } else { &m.content };
+            let content_preview = truncate_at_char_boundary(&m.content, 600);
             let tags = m.tags.iter().take(5).map(|t| t.as_str()).collect::<Vec<_>>().join(", ");
             format!("MEMORY {}: [category: {}] [tags: {}] [relevance: {:.0}%]\nTitle: {}\nContent: {}\n",
                 i + 1, m.category, tags, score * 100.0, m.title, content_preview)
@@ -7781,11 +7826,7 @@ async fn gemini_chat_respond(
         .iter()
         .take(5)
         .map(|m| {
-            let preview = if m.content.len() > 150 {
-                &m.content[..150]
-            } else {
-                &m.content
-            };
+            let preview = truncate_at_char_boundary(&m.content, 150);
             format!("- <b>{}</b> [{}]: {}", m.title, m.category, preview)
         })
         .collect();
@@ -7873,7 +7914,7 @@ You are chatting with {user} in Google Chat. Your role:
         return Err(format!(
             "Gemini API {}: {}",
             status,
-            &text[..text.len().min(200)]
+            truncate_at_char_boundary(&text, 200)
         ));
     }
 
@@ -7904,7 +7945,7 @@ You are chatting with {user} in Google Chat. Your role:
     let truncated = if html.len() > 3000 {
         format!(
             "{}…\n\n<i>See more at <a href=\"https://pi.ruv.io\">pi.ruv.io</a></i>",
-            &html[..3000]
+            truncate_at_char_boundary(&html, 3000)
         )
     } else {
         html
@@ -8139,6 +8180,12 @@ async fn email_inbound(
     }
 }
 
+/// Maximum number of concurrent SSE proxy sessions held in `state.sessions`.
+///
+/// Each session pins an entry in two DashMaps and one mpsc channel for the
+/// life of the process, so this is the memory bound on `/internal/session/create`.
+const MAX_SSE_SESSIONS: usize = 1024;
+
 /// Verify the system key for internal endpoints
 fn verify_system_key(headers: &HeaderMap) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     let system_key = std::env::var("BRAIN_SYSTEM_KEY").unwrap_or_default();
@@ -8164,8 +8211,15 @@ fn verify_system_key(headers: &HeaderMap) -> Result<(), (StatusCode, Json<serde_
 // ══════════════════════════════════════════════════════════════════════
 // Internal Queue Endpoints (ADR-130)
 //
-// These are service-to-service endpoints used by the SSE proxy to
-// communicate with the API server. No authentication required.
+// Service-to-service endpoints used by the SSE proxy (`ruvbrain-sse`) to
+// communicate with the API server. They are NOT internal in any network
+// sense: the Cloud Run service grants `roles/run.invoker` to `allUsers`, so
+// `/internal/*` is reachable from the public internet exactly like `/v1/*`.
+//
+// They are therefore gated on the shared `BRAIN_SYSTEM_KEY`, the mechanism
+// `/v1/notify/digest` already uses. DEPLOY DEPENDENCY: the `ruvbrain-sse`
+// service must have `BRAIN_SYSTEM_KEY` in its environment before this
+// change reaches production, or the SSE transport breaks. See the ADR.
 // ══════════════════════════════════════════════════════════════════════
 
 /// Request body for POST /internal/queue/push
@@ -8195,8 +8249,13 @@ struct InternalQueueDrainQuery {
 /// not found, 500 if the channel send fails.
 async fn internal_queue_push(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<InternalQueuePushRequest>,
 ) -> StatusCode {
+    if verify_system_key(&headers).is_err() {
+        return StatusCode::UNAUTHORIZED;
+    }
+
     let sender = match state.sessions.get(&body.session_id) {
         Some(s) => s.clone(),
         None => {
@@ -8229,8 +8288,14 @@ async fn internal_queue_push(
 /// in `internal_session_create`.
 async fn internal_queue_drain(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<InternalQueueDrainQuery>,
 ) -> Json<Vec<String>> {
+    if verify_system_key(&headers).is_err() {
+        // Same shape as an empty drain — callers treat this as "nothing yet".
+        return Json(Vec::new());
+    }
+
     // Swap the buffer with an empty vec to drain atomically
     let messages = state
         .response_queues
@@ -8254,8 +8319,30 @@ async fn internal_queue_drain(
 /// return buffered responses. Returns 200 with the session_id echoed back.
 async fn internal_session_create(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<InternalSessionCreateRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if let Err((status, body)) = verify_system_key(&headers) {
+        return (status, body);
+    }
+
+    // Bound the session table. Each call permanently adds one entry to two
+    // DashMaps plus an mpsc channel; the draining task only cleans up once
+    // the sender is dropped, and the sender lives in `state.sessions`, so
+    // without a cap an unbounded number of `create` calls is an unbounded
+    // memory leak. Re-creating an existing session id is always allowed so a
+    // reconnecting proxy is never locked out by the cap.
+    if !state.sessions.contains_key(&body.session_id) && state.sessions.len() >= MAX_SSE_SESSIONS {
+        tracing::warn!(
+            "internal/session/create: refusing new session, at cap ({})",
+            MAX_SSE_SESSIONS
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "session capacity reached" })),
+        );
+    }
+
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
     state.sessions.insert(body.session_id.clone(), tx);
     state
@@ -8290,8 +8377,13 @@ async fn internal_session_create(
 /// Removes the session and its response queue, then returns 200.
 async fn internal_session_delete(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> StatusCode {
+    if verify_system_key(&headers).is_err() {
+        return StatusCode::UNAUTHORIZED;
+    }
+
     state.sessions.remove(&id);
     state.response_queues.remove(&id);
     tracing::info!("internal/session/delete: removed session {}", id);

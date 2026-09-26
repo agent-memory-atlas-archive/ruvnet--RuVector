@@ -13,6 +13,8 @@ use ruvector_solver::types::CsrMatrix;
 use ruvector_sparsifier::traits::Sparsifier;
 use ruvector_sparsifier::{AdaptiveGeoSpar, SparseGraph, SparsifierConfig};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// Knowledge graph maintaining similarity relationships
@@ -22,16 +24,33 @@ pub struct KnowledgeGraph {
     similarity_threshold: f64,
     /// Real min-cut structure (lazy-initialized)
     mincut: Option<DynamicMinCut>,
-    /// CSR cache for solver-based search
-    csr_cache: Option<CsrMatrix<f64>>,
+    /// CSR cache for solver-based search.
+    ///
+    /// Behind its own lock, with interior mutability, so the lazy rebuild
+    /// does not force `ranked_search` to be `&mut self`. Taking a write lock
+    /// on the whole graph to read it was the reason every search after an
+    /// inject blocked every other reader.
+    csr_cache: parking_lot::RwLock<Option<Arc<CsrMatrix<f64>>>>,
     /// Maps graph indices to memory IDs
     node_ids: Vec<Uuid>,
     /// Reverse index: Uuid → position in node_ids (O(1) lookup)
     node_index: HashMap<Uuid, usize>,
     /// Whether the CSR cache needs rebuilding
-    csr_dirty: bool,
+    csr_dirty: AtomicBool,
+    /// Serialises CSR rebuilds so N concurrent first-searches after an inject
+    /// rebuild once between them instead of N times.
+    csr_build: parking_lot::Mutex<()>,
     /// Spectral sparsifier for compressed graph analytics (ADR-116)
     sparsifier: Option<AdaptiveGeoSpar>,
+    /// Bumped every time `node_index` is REASSIGNED rather than appended to.
+    ///
+    /// A sparsifier is built against node *positions*, so any reshuffle
+    /// invalidates one that is mid-build. Comparing counts is not enough:
+    /// a remove plus an add restores the counts while shifting every index
+    /// after the removed node, and `rebuild_from_batch` reassigns every
+    /// position even when the memory set is identical (it iterates a DashMap,
+    /// whose order is arbitrary).
+    index_generation: u64,
 }
 
 struct GraphNode {
@@ -55,11 +74,13 @@ impl KnowledgeGraph {
             edges: Vec::new(),
             similarity_threshold: 0.55,
             mincut: None,
-            csr_cache: None,
+            csr_cache: parking_lot::RwLock::new(None),
             node_ids: Vec::new(),
             node_index: HashMap::new(),
-            csr_dirty: false,
+            csr_dirty: AtomicBool::new(false),
+            csr_build: parking_lot::Mutex::new(()),
             sparsifier: None,
+            index_generation: 0,
         }
     }
 
@@ -78,10 +99,11 @@ impl KnowledgeGraph {
         self.edges.clear();
         self.node_ids.clear();
         self.node_index.clear();
-        self.csr_dirty = true;
-        self.csr_cache = None;
+        self.mark_csr_dirty();
         self.mincut = None;
         self.sparsifier = None;
+        // Every node position is about to be reassigned.
+        self.index_generation = self.index_generation.wrapping_add(1);
 
         let n = memories.len();
         if n == 0 {
@@ -230,7 +252,7 @@ impl KnowledgeGraph {
         self.edges.extend(new_edges);
 
         // Mark CSR as dirty — deferred rebuild until next query
-        self.csr_dirty = true;
+        self.mark_csr_dirty();
     }
 
     /// Remove a memory from the graph
@@ -263,8 +285,10 @@ impl KnowledgeGraph {
         }
         // Invalidate caches — full rebuild needed
         self.mincut = None;
-        self.csr_cache = None;
-        self.csr_dirty = false;
+        *self.csr_cache.write() = None;
+        self.csr_dirty.store(false, Ordering::Release);
+        // Positions after the removed node have all shifted.
+        self.index_generation = self.index_generation.wrapping_add(1);
         // Sparsifier indices are now stale after compaction — rebuild lazily
         self.sparsifier = None;
     }
@@ -274,7 +298,7 @@ impl KnowledgeGraph {
     /// Uses ForwardPushSolver PPR for graph-aware relevance when CSR is
     /// available, merging with cosine similarity scores. Falls back to
     /// brute-force cosine if CSR is unavailable.
-    pub fn ranked_search(&mut self, query_embedding: &[f32], k: usize) -> Vec<(Uuid, f64)> {
+    pub fn ranked_search(&self, query_embedding: &[f32], k: usize) -> Vec<(Uuid, f64)> {
         self.ensure_csr();
         // Brute-force cosine scores
         let mut cosine_scores: Vec<(Uuid, f64)> = self
@@ -302,7 +326,7 @@ impl KnowledgeGraph {
     /// Builds a CsrMatrix from graph edges and runs PPR from the node
     /// most similar to `query_embedding`. Returns a map of node ID to
     /// PPR score, or `None` if PPR cannot be computed.
-    pub fn pagerank_search(&mut self, query_embedding: &[f32], k: usize) -> Vec<(Uuid, f64)> {
+    pub fn pagerank_search(&self, query_embedding: &[f32], k: usize) -> Vec<(Uuid, f64)> {
         self.ensure_csr();
         if let Some(ppr_map) = self.pagerank_scores(query_embedding, k) {
             let mut results: Vec<(Uuid, f64)> = ppr_map.into_iter().collect();
@@ -314,17 +338,41 @@ impl KnowledgeGraph {
         }
     }
 
-    /// Ensure CSR cache is up-to-date (lazy rebuild)
-    fn ensure_csr(&mut self) {
-        if self.csr_dirty {
-            self.rebuild_csr();
-            self.csr_dirty = false;
+    /// Mark the CSR cache stale. Cheap; the rebuild is deferred to the next
+    /// query that actually needs it.
+    fn mark_csr_dirty(&self) {
+        self.csr_dirty.store(true, Ordering::Release);
+    }
+
+    /// Ensure the CSR cache is up-to-date (lazy rebuild).
+    ///
+    /// Takes `&self`: the cache lives behind its own lock, so a search no
+    /// longer needs a write lock on the whole graph. Double-checked under
+    /// `csr_build` so a burst of concurrent searches after an inject performs
+    /// exactly one rebuild rather than one per thread.
+    ///
+    /// The rebuild is still synchronous, so a search never runs against a
+    /// stale CSR — this fixes the lock contention without introducing a
+    /// staleness window.
+    fn ensure_csr(&self) {
+        if !self.csr_dirty.load(Ordering::Acquire) {
+            return;
         }
+        let _build = self.csr_build.lock();
+        // Re-check: another thread may have rebuilt while we waited.
+        if !self.csr_dirty.load(Ordering::Acquire) {
+            return;
+        }
+        self.rebuild_csr();
+        self.csr_dirty.store(false, Ordering::Release);
     }
 
     /// Internal: compute raw PPR scores keyed by node ID.
     fn pagerank_scores(&self, query_embedding: &[f32], k: usize) -> Option<HashMap<Uuid, f64>> {
-        let csr = self.csr_cache.as_ref()?;
+        // Clone the Arc out and release the cache lock immediately, so a
+        // concurrent rebuild is never blocked by a long-running PPR solve.
+        let csr = self.csr_cache.read().clone()?;
+        let csr = csr.as_ref();
         if csr.rows == 0 {
             return None;
         }
@@ -730,10 +778,10 @@ impl KnowledgeGraph {
     }
 
     /// Rebuild the CsrMatrix from the adjacency list
-    pub fn rebuild_csr(&mut self) {
+    pub fn rebuild_csr(&self) {
         let n = self.node_ids.len();
         if n == 0 {
-            self.csr_cache = None;
+            *self.csr_cache.write() = None;
             return;
         }
 
@@ -747,7 +795,10 @@ impl KnowledgeGraph {
             })
             .collect();
 
-        self.csr_cache = Some(CsrMatrix::<f64>::from_coo(n, n, entries));
+        // Build the new matrix before taking the cache write lock, so readers
+        // only ever wait for the pointer swap, not for the O(edges) build.
+        let built = CsrMatrix::<f64>::from_coo(n, n, entries);
+        *self.csr_cache.write() = Some(Arc::new(built));
     }
 
     /// Get the k nearest graph neighbors for a given memory ID.
@@ -776,11 +827,31 @@ impl KnowledgeGraph {
         self.nodes.len()
     }
 
+    /// The node ids in index order. Exposed for tests that need to name a
+    /// specific node (e.g. to drive `remove_memory`).
+    pub fn node_ids_snapshot(&self) -> Vec<Uuid> {
+        self.node_ids.clone()
+    }
+
     pub fn edge_count(&self) -> usize {
         self.edges.len()
     }
 
     // ----- Sparsifier (ADR-116) -----------------------------------------------
+
+    /// Tuning shared by the in-place and off-lock sparsifier builds.
+    fn sparsifier_config() -> SparsifierConfig {
+        SparsifierConfig {
+            epsilon: 0.2,
+            edge_budget_factor: 8,
+            audit_interval: 500,
+            walk_length: 6,
+            num_walks: 10,
+            n_audit_probes: 30,
+            auto_rebuild_on_audit_failure: true,
+            ..Default::default()
+        }
+    }
 
     /// Initialize or rebuild the spectral sparsifier from current edges.
     pub fn rebuild_sparsifier(&mut self) {
@@ -799,18 +870,7 @@ impl KnowledgeGraph {
             }
         }
 
-        let config = SparsifierConfig {
-            epsilon: 0.2,
-            edge_budget_factor: 8,
-            audit_interval: 500,
-            walk_length: 6,
-            num_walks: 10,
-            n_audit_probes: 30,
-            auto_rebuild_on_audit_failure: true,
-            ..Default::default()
-        };
-
-        match AdaptiveGeoSpar::build(&sg, config) {
+        match AdaptiveGeoSpar::build(&sg, Self::sparsifier_config()) {
             Ok(spar) => {
                 tracing::info!(
                     full_edges = self.edges.len(),
@@ -825,6 +885,135 @@ impl KnowledgeGraph {
                 self.sparsifier = None;
             }
         }
+    }
+
+    /// Snapshot everything the sparsifier build needs, as plain data.
+    ///
+    /// Returned under a *read* lock and then used with no lock held at all,
+    /// so the expensive `AdaptiveGeoSpar::build` no longer runs inside
+    /// `graph.write()`. Returns `(coo_entries, node_count, edge_count, index_generation)`;
+    /// the last three are the guard values for `install_sparsifier`.
+    pub fn sparsifier_snapshot(&self) -> Option<(Vec<(usize, usize, f64)>, usize, usize, u64)> {
+        if self.node_ids.is_empty() || self.edges.is_empty() {
+            return None;
+        }
+        let entries: Vec<(usize, usize, f64)> = self
+            .edges
+            .iter()
+            .filter_map(|e| {
+                let &u = self.node_index.get(&e.source)?;
+                let &v = self.node_index.get(&e.target)?;
+                Some((u, v, e.weight))
+            })
+            .collect();
+        Some((
+            entries,
+            self.node_ids.len(),
+            self.edges.len(),
+            self.index_generation,
+        ))
+    }
+
+    /// Build a sparsifier from a snapshot. Pure — holds no lock, touches no
+    /// `self`, and is safe to call from `spawn_blocking`.
+    pub fn build_sparsifier_from(
+        entries: &[(usize, usize, f64)],
+        node_count: usize,
+    ) -> Option<AdaptiveGeoSpar> {
+        if node_count == 0 || entries.is_empty() {
+            return None;
+        }
+        let mut sg = SparseGraph::with_capacity(node_count);
+        for &(u, v, w) in entries {
+            let _ = sg.insert_or_update_edge(u, v, w);
+        }
+        match AdaptiveGeoSpar::build(&sg, Self::sparsifier_config()) {
+            Ok(spar) => Some(spar),
+            Err(e) => {
+                tracing::warn!("Sparsifier build failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// Install a sparsifier built from a snapshot, under a brief write lock.
+    ///
+    /// Refuses the install in three cases, each of which would otherwise
+    /// leave a sparsifier that silently describes the wrong graph:
+    ///
+    /// 1. **Node positions were reassigned** (`index_generation` changed).
+    ///    Counts alone do not catch this — a remove plus an add restores them
+    ///    while shifting every index past the removed node, and
+    ///    `rebuild_from_batch` reassigns all of them even for an identical
+    ///    memory set.
+    /// 2. **The graph shrank**, a cheap belt-and-braces check on top of (1).
+    /// 3. **Someone already installed a sparsifier** while this build ran —
+    ///    `rebuild_from_batch` is followed by an inline `rebuild_sparsifier`
+    ///    on the small-graph path, and overwriting that fresh one with this
+    ///    older build would be a regression.
+    ///
+    /// Edges appended during the build are replayed, because `add_memory`
+    /// only feeds the sparsifier while it is `Some` — and it was `None` for
+    /// the whole build window, so those edges are otherwise lost.
+    ///
+    /// Returns whether the sparsifier was installed.
+    pub fn install_sparsifier(
+        &mut self,
+        spar: AdaptiveGeoSpar,
+        snapshot_nodes: usize,
+        snapshot_edges: usize,
+        snapshot_generation: u64,
+    ) -> bool {
+        if self.index_generation != snapshot_generation {
+            tracing::warn!(
+                "Discarding sparsifier build: node positions were reassigned \
+                 during build (generation {} -> {})",
+                snapshot_generation,
+                self.index_generation
+            );
+            return false;
+        }
+        if self.node_ids.len() < snapshot_nodes || self.edges.len() < snapshot_edges {
+            tracing::warn!(
+                "Discarding sparsifier build: graph shrank during build \
+                 (nodes {} -> {}, edges {} -> {})",
+                snapshot_nodes,
+                self.node_ids.len(),
+                snapshot_edges,
+                self.edges.len()
+            );
+            return false;
+        }
+        if self.sparsifier.is_some() {
+            tracing::info!(
+                "Discarding sparsifier build: a newer sparsifier was installed \
+                 while this one was building"
+            );
+            return false;
+        }
+
+        let mut spar = spar;
+        let replayed = self.edges.len() - snapshot_edges;
+        for edge in &self.edges[snapshot_edges..] {
+            if let (Some(&u), Some(&v)) = (
+                self.node_index.get(&edge.source),
+                self.node_index.get(&edge.target),
+            ) {
+                let _ = spar.insert_edge(u, v, edge.weight);
+            }
+        }
+        if replayed > 0 {
+            tracing::info!("Replayed {replayed} edges added during sparsifier build");
+        }
+
+        tracing::info!(
+            full_edges = self.edges.len(),
+            sparsified_edges = spar.sparsifier().num_edges(),
+            compression = %format!("{:.1}x", spar.compression_ratio()),
+            "Sparsifier installed"
+        );
+        self.sparsifier = Some(spar);
+        true
     }
 
     /// Ensure the sparsifier is initialized (lazy build on first access).

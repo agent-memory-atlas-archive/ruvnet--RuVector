@@ -735,10 +735,27 @@ impl FirestoreClient {
     /// Delete a memory (contributor-scoped, cache + Firestore)
     /// Uses atomic remove_if to prevent TOCTOU race
     pub async fn delete_memory(&self, id: &Uuid, contributor: &str) -> Result<bool, StoreError> {
+        self.delete_memory_as(id, contributor, false).await
+    }
+
+    /// Delete a memory, optionally as a system operator.
+    ///
+    /// Contributor-scoped deletes can only ever remove rows whose
+    /// `contributor_id` equals the caller's pseudonym. Pipeline injections are
+    /// stored under a synthetic `pipeline:{source}` owner that no pseudonym can
+    /// ever equal, so before this override existed they could not be removed
+    /// through the API at all. `system = true` (a `BRAIN_SYSTEM_KEY` holder)
+    /// bypasses the ownership check so an operator can clean them up.
+    pub async fn delete_memory_as(
+        &self,
+        id: &Uuid,
+        contributor: &str,
+        system: bool,
+    ) -> Result<bool, StoreError> {
         // Atomic check-and-remove: no TOCTOU window
         let removed = self
             .memories
-            .remove_if(id, |_, entry| entry.contributor_id == contributor);
+            .remove_if(id, |_, entry| system || entry.contributor_id == contributor);
         match removed {
             Some(_) => {
                 self.firestore_delete("brain_memories", &id.to_string())
@@ -889,7 +906,11 @@ impl FirestoreClient {
         offset: usize,
         sort: &crate::types::ListSort,
     ) -> Result<(Vec<BrainMemory>, usize), StoreError> {
-        let mut memories: Vec<BrainMemory> = self
+        // Collect SORT KEYS, not whole memories. `BrainMemory` carries a
+        // 384-dim embedding plus several Strings, so cloning every matching
+        // row to return `limit` of them made the work proportional to the
+        // corpus rather than to the page. A key is 24 bytes.
+        let mut keys: Vec<(f64, Uuid)> = self
             .memories
             .iter()
             .filter(|entry| {
@@ -898,34 +919,46 @@ impl FirestoreClient {
                 let tags_ok = tags.map_or(true, |t| t.iter().any(|tag| m.tags.contains(tag)));
                 category_ok && tags_ok
             })
-            .map(|entry| entry.value().clone())
+            .map(|entry| {
+                let m = entry.value();
+                let key = match sort {
+                    // micros keeps sub-second ordering and is exactly
+                    // representable in f64 for any plausible timestamp.
+                    ListSort::UpdatedAt => m.updated_at.timestamp_micros() as f64,
+                    ListSort::Quality => m.quality_score.mean(),
+                    ListSort::Votes => m.quality_score.observations(),
+                };
+                (key, m.id)
+            })
             .collect();
 
-        let total_count = memories.len();
+        let total_count = keys.len();
 
-        match sort {
-            ListSort::UpdatedAt => {
-                memories.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-            }
-            ListSort::Quality => {
-                memories.sort_by(|a, b| {
-                    b.quality_score
-                        .mean()
-                        .partial_cmp(&a.quality_score.mean())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-            }
-            ListSort::Votes => {
-                memories.sort_by(|a, b| {
-                    b.quality_score
-                        .observations()
-                        .partial_cmp(&a.quality_score.observations())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-            }
+        // Descending by key, with the id as a deterministic tie-break. The
+        // previous code sorted equal keys by DashMap iteration order, which
+        // is arbitrary and can differ between two identical requests; this is
+        // strictly more stable.
+        let cmp = |a: &(f64, Uuid), b: &(f64, Uuid)| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        };
+
+        // Only the first `offset + limit` entries can appear on this page, so
+        // partition at that point and sort just that prefix.
+        let end = offset.saturating_add(limit).min(total_count);
+        if end < total_count {
+            keys.select_nth_unstable_by(end, cmp);
         }
+        let head = &mut keys[..end];
+        head.sort_unstable_by(cmp);
 
-        let paginated: Vec<BrainMemory> = memories.into_iter().skip(offset).take(limit).collect();
+        // Clone only the rows actually being returned.
+        let paginated: Vec<BrainMemory> = head
+            .iter()
+            .skip(offset)
+            .filter_map(|(_, id)| self.memories.get(id).map(|e| e.value().clone()))
+            .collect();
 
         Ok((paginated, total_count))
     }
