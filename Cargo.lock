@@ -7425,7 +7425,7 @@ dependencies = [
  "rkyv",
  "roaring",
  "ruvector-attention",
- "ruvector-core 2.3.0",
+ "ruvector-core 2.3.1",
  "ruvector-gnn",
  "ruvector-graph",
  "ruvector-hyperbolic-hnsw",
@@ -8478,7 +8478,7 @@ dependencies = [
  "ndarray 0.16.1",
  "rand 0.8.6",
  "rand_distr 0.4.3",
- "ruvector-core 2.3.0",
+ "ruvector-core 2.3.1",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -9012,7 +9012,7 @@ dependencies = [
  "rayon",
  "ruvector-cognitive-container",
  "ruvector-coherence",
- "ruvector-core 2.3.0",
+ "ruvector-core 2.3.1",
  "ruvector-mincut 2.3.1",
  "serde",
  "serde_json",
@@ -9042,7 +9042,7 @@ dependencies = [
  "rand_distr 0.4.3",
  "rayon",
  "reqwest",
- "ruvector-core 2.3.0",
+ "ruvector-core 2.3.1",
  "rvf-crypto",
  "rvf-types",
  "rvf-wire",
@@ -9107,7 +9107,7 @@ dependencies = [
  "predicates",
  "prettytable-rs",
  "rand 0.8.6",
- "ruvector-core 2.3.0",
+ "ruvector-core 2.3.1",
  "ruvector-gnn",
  "ruvector-graph",
  "serde",
@@ -9140,7 +9140,7 @@ dependencies = [
  "rand_distr 0.4.3",
  "rayon",
  "ruvector-attention",
- "ruvector-core 2.3.0",
+ "ruvector-core 2.3.1",
  "ruvector-gnn",
  "ruvector-graph",
  "serde",
@@ -9165,7 +9165,7 @@ dependencies = [
  "futures",
  "parking_lot 0.12.5",
  "rand 0.8.6",
- "ruvector-core 2.3.0",
+ "ruvector-core 2.3.1",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -9244,7 +9244,7 @@ dependencies = [
  "criterion 0.5.1",
  "dashmap 6.2.1",
  "parking_lot 0.12.5",
- "ruvector-core 2.3.0",
+ "ruvector-core 2.3.1",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -9294,7 +9294,7 @@ dependencies = [
  "fs4",
  "libc",
  "rustix 1.1.4",
- "ruvector-core 2.3.0",
+ "ruvector-core 2.3.1",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -9356,7 +9356,7 @@ dependencies = [
 
 [[package]]
 name = "ruvector-core"
-version = "2.3.0"
+version = "2.3.1"
 dependencies = [
  "anyhow",
  "bincode 2.0.1",
@@ -9380,6 +9380,7 @@ dependencies = [
  "redb",
  "reqwest",
  "rkyv",
+ "ruvector-core 2.3.1",
  "ruvector-turboquant",
  "serde",
  "serde_json",
@@ -9422,7 +9423,7 @@ dependencies = [
  "pqcrypto-kyber",
  "proptest",
  "rand 0.8.6",
- "ruvector-core 2.3.0",
+ "ruvector-core 2.3.1",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -9701,7 +9702,7 @@ dependencies = [
  "chrono",
  "dashmap 6.2.1",
  "ordered-float",
- "ruvector-core 2.3.0",
+ "ruvector-core 2.3.1",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -9763,7 +9764,7 @@ dependencies = [
  "rand 0.8.6",
  "rand_distr 0.4.3",
  "rayon",
- "ruvector-core 2.3.0",
+ "ruvector-core 2.3.1",
  "ruvector-diskann",
  "serde",
  "serde_json",
@@ -9808,7 +9809,7 @@ dependencies = [
 
 [[package]]
 name = "ruvector-graph"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "anyhow",
  "bincode 2.0.1",
@@ -9848,7 +9849,7 @@ dependencies = [
  "rkyv",
  "roaring",
  "ruvector-cluster",
- "ruvector-core 2.3.0",
+ "ruvector-core 2.3.1",
  "ruvector-raft",
  "ruvector-replication",
  "serde",
@@ -9901,7 +9902,7 @@ dependencies = [
  "napi",
  "napi-build",
  "napi-derive",
- "ruvector-core 2.3.0",
+ "ruvector-core 2.3.1",
  "ruvector-graph",
  "serde",
  "serde_json",
@@ -9962,7 +9963,7 @@ dependencies = [
  "js-sys",
  "parking_lot 0.12.5",
  "regex",
- "ruvector-core 2.3.0",
+ "ruvector-core 2.3.1",
  "ruvector-graph",
  "serde",
  "serde-wasm-bindgen",
@@ -9987,7 +9988,7 @@ dependencies = [
  "criterion 0.5.1",
  "hailort-sys",
  "proptest",
- "ruvector-core 2.3.0",
+ "ruvector-core 2.3.1",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
@@ -10008,7 +10009,7 @@ dependencies = [
  "prost 0.13.5",
  "protoc-bin-vendored",
  "rcgen",
- "ruvector-core 2.3.0",
+ "ruvector-core 2.3.1",
  "ruvector-hailo",
  "ruvector-mmwave",
  "ruvllm 2.3.0",
@@ -10265,7 +10266,7 @@ dependencies = [
  "rand 0.8.6",
  "rayon",
  "roaring",
- "ruvector-core 2.3.0",
+ "ruvector-core 2.3.1",
  "ruvector-graph",
  "serde",
  "serde_json",
@@ -10376,7 +10377,7 @@ dependencies = [
  "napi-build",
  "napi-derive",
  "ruvector-collections",
- "ruvector-core 2.3.0",
+ "ruvector-core 2.3.1",
  "ruvector-filter",
  "ruvector-metrics",
  "serde",
@@ -10471,7 +10472,7 @@ dependencies = [
  "futures",
  "parking_lot 0.12.5",
  "rand 0.8.6",
- "ruvector-core 2.3.0",
+ "ruvector-core 2.3.1",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -10503,7 +10504,7 @@ dependencies = [
  "futures",
  "parking_lot 0.12.5",
  "rand 0.8.6",
- "ruvector-core 2.3.0",
+ "ruvector-core 2.3.1",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -10713,7 +10714,7 @@ dependencies = [
  "axum 0.7.9",
  "dashmap 6.2.1",
  "parking_lot 0.12.5",
- "ruvector-core 2.3.0",
+ "ruvector-core 2.3.1",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -10732,7 +10733,7 @@ dependencies = [
  "bincode 2.0.1",
  "chrono",
  "flate2",
- "ruvector-core 2.3.0",
+ "ruvector-core 2.3.1",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -10838,7 +10839,7 @@ dependencies = [
  "rand_distr 0.4.3",
  "rayon",
  "reqwest",
- "ruvector-core 2.3.0",
+ "ruvector-core 2.3.1",
  "ruvector-diskann",
  "ruvector-hnsw-repair",
  "ruvector-hybrid",
@@ -11089,7 +11090,7 @@ dependencies = [
  "proptest",
  "ruvector-cognitive-container",
  "ruvector-coherence",
- "ruvector-core 2.3.0",
+ "ruvector-core 2.3.1",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -11124,7 +11125,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "rand 0.8.6",
  "ruvector-collections",
- "ruvector-core 2.3.0",
+ "ruvector-core 2.3.1",
  "ruvector-filter",
  "serde",
  "serde-wasm-bindgen",
@@ -11355,7 +11356,7 @@ dependencies = [
  "rayon",
  "regex",
  "ruvector-attention",
- "ruvector-core 2.3.0",
+ "ruvector-core 2.3.1",
  "ruvector-gnn",
  "ruvector-graph",
  "ruvector-sona 0.2.1",
@@ -11844,7 +11845,7 @@ dependencies = [
 
 [[package]]
 name = "rvf-types"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "ed25519-dalek",
  "rand_core 0.6.4",
@@ -11852,7 +11853,7 @@ dependencies = [
 
 [[package]]
 name = "rvf-wire"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "crc32c",
  "rvf-types",
@@ -11886,7 +11887,7 @@ dependencies = [
  "js-sys",
  "once_cell",
  "parking_lot 0.12.5",
- "ruvector-core 2.3.0",
+ "ruvector-core 2.3.1",
  "rvf-runtime",
  "rvf-types",
  "serde",
@@ -12353,7 +12354,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "criterion 0.5.1",
- "ruvector-core 2.3.0",
+ "ruvector-core 2.3.1",
  "ruvector-graph",
  "serde",
  "serde_json",
@@ -13911,7 +13912,7 @@ name = "train-discoveries"
 version = "0.1.0"
 dependencies = [
  "rand 0.8.6",
- "ruvector-core 2.3.0",
+ "ruvector-core 2.3.1",
  "ruvector-solver",
  "serde",
  "serde_json",
