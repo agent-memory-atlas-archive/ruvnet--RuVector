@@ -63,16 +63,25 @@ pub async fn create_router() -> (Router, AppState) {
             store_hydrate.hydration_errors()
         );
         if count > 0 {
-            let mems = store_hydrate.all_memories();
-            let mut g = graph_hydrate.write();
-            g.rebuild_from_batch(&mems);
-            tracing::info!(
-                "Graph rebuilt after hydration: {} nodes, {} edges",
-                g.node_count(),
-                g.edge_count()
-            );
-            if g.edge_count() <= 100_000 {
-                g.rebuild_sparsifier();
+            // ADR-349 #6: the instance is already serving here, so the O(n²)
+            // edge pass must not run under `graph.write()`. Build off-lock,
+            // swap in under a brief write lock; the sparsifier follows via
+            // the P3 off-lock path (same <=5M cap as main.rs's background
+            // task, which this supersedes on the cold-start path).
+            let snapshot_store = store_hydrate.clone();
+            let outcome = crate::graph::rebuild::rebuild_off_lock(
+                graph_hydrate.clone(),
+                move || snapshot_store.all_memories(),
+                Some(crate::graph::rebuild::SPARSIFIER_MAX_EDGES),
+            )
+            .await;
+            match outcome {
+                crate::graph::rebuild::RebuildOutcome::Installed(r) => tracing::info!(
+                    "Graph rebuilt after hydration: {} nodes, {} edges",
+                    r.nodes,
+                    r.edges
+                ),
+                other => tracing::warn!("Graph rebuild after hydration: {other:?}"),
             }
         }
     });
@@ -4135,19 +4144,36 @@ async fn pipeline_optimize(
                 )
             }
             "rebuild_graph" => {
-                let all_mems = state.store.all_memories();
-                let mut graph = state.graph.write();
-                // ADR-149 P3: batch rebuild instead of one-at-a-time add_memory loop
-                graph.rebuild_from_batch(&all_mems);
-                graph.rebuild_sparsifier();
-                (
-                    true,
-                    format!(
-                        "Graph rebuilt: {} nodes, {} edges",
-                        graph.node_count(),
-                        graph.edge_count()
+                // ADR-349 #6: build off-lock and swap in under a brief write
+                // lock. Detached task, so a scheduler/client timeout cannot
+                // cancel it half-way; single-flight against the cold-start
+                // rebuild and against itself.
+                use crate::graph::rebuild::RebuildOutcome;
+                let store = state.store.clone();
+                let handle = crate::graph::rebuild::spawn_rebuild(
+                    state.graph.clone(),
+                    move || store.all_memories(),
+                    Some(usize::MAX),
+                );
+                match handle.await {
+                    Ok(RebuildOutcome::Installed(r)) => (
+                        true,
+                        format!("Graph rebuilt: {} nodes, {} edges", r.nodes, r.edges),
                     ),
-                )
+                    Ok(RebuildOutcome::AlreadyRunning) => (
+                        // Only the post-hydration rebuild can be in flight here
+                        // (optimize_semaphore serialises optimize runs), and it
+                        // snapshots a complete store, so the graph is being
+                        // rebuilt: report success, not a failed run.
+                        true,
+                        "Graph rebuild already in progress (post-hydration); skipped".into(),
+                    ),
+                    Ok(RebuildOutcome::Superseded) => {
+                        (false, "Graph rebuild superseded by a newer rebuild".into())
+                    }
+                    Ok(RebuildOutcome::Failed(e)) => (false, format!("Graph rebuild failed: {e}")),
+                    Err(e) => (false, format!("Graph rebuild task failed: {e}")),
+                }
             }
             "cleanup" => {
                 // Trigger SONA garbage collection and nonce cleanup

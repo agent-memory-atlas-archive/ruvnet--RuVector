@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (code landed). Three items are deliberately **deferred with reasons**
+Accepted (code landed; item 6 fixed by P5 in a follow-up). Three items are deliberately **deferred with reasons**
 rather than guessed at — see "Deliberately not decided here".
 
 > **Numbering note.** Drafted as ADR-348 on 2026-09-19; renumbered to 349 at
@@ -379,10 +379,11 @@ risk: the larger it grows, the more a deploy changes at once and the harder a
 regression is to attribute. Deploys are human-authorized; this ADR does not
 perform one.
 
-**6. M4 — the full graph rebuild holds the graph write lock for O(n²) work.
-Not fixed here; this is the dominant 504 signature as of 2026-09-26.**
+**6. M4 — the full graph rebuild held the graph write lock for O(n²) work.
+Fixed in a follow-up (P5 below); this was the dominant 504 signature as of
+2026-09-26.**
 `KnowledgeGraph::rebuild_from_batch` computes every pairwise cosine
-(~1.8B pairs at the live 59,758 nodes) and runs with `graph.write()` held at
+(~1.8B pairs at the live 59,758 nodes) and ran with `graph.write()` held at
 two sites:
 
 - `rebuild_graph` in `/v1/pipeline/optimize`, inside the async handler (not
@@ -396,10 +397,125 @@ two sites:
 Production logs for 2026-09-23..26 show `Graph rebuilt from batch (ADR-149
 P3)` at exactly 03:00/06:00/18:00 UTC (the scheduler jobs) and at ~hh:12–:18
 on each fresh instance id (cold starts), each followed by 504 bursts. P2 and
-P3 do not touch this path. The natural follow-up is the same shape as P3:
-snapshot the memories, build the new graph off-lock in `spawn_blocking`, swap
-it in under a brief write lock, and bump `index_generation` so an in-flight
-sparsifier build refuses to install.
+P3 do not touch this path.
+
+#### P5 — build the graph off-lock (fix for item 6)
+
+Same shape as P3, in `src/graph/rebuild.rs`:
+
+1. **`begin_rebuild(&mut self)`** — brief write lock. Returns a ticket, or
+   `None` if a rebuild is already in flight. The marker lives *in the graph*,
+   so it is single-flight across both sites (a `brain-graph` tick landing
+   while a fresh instance is still on its post-hydration rebuild is refused,
+   not doubled). It also arms a **mutation log**.
+2. **`build_batch(memories, threshold, threads)`** — an associated fn over
+   plain data (no `self`, so no lock can be held across it), run in
+   `spawn_blocking`. The memory snapshot (`store.all_memories()`, a clone of
+   ~60k memories) is taken *inside* the blocking closure too, and *after* the
+   log is armed. Readers keep using the old graph; writers keep mutating it.
+3. **`install_batch(&mut self, ticket, build)`** — brief write lock. Swaps
+   the new adjacency in, clears mincut/sparsifier, marks the CSR dirty, bumps
+   `index_generation` (so an in-flight P3 sparsifier build refuses to
+   install), then **replays the log in order**: an add whose id the snapshot
+   already has is skipped; any other add is inserted exactly as
+   `add_memory` would; a remove deletes the node if the snapshot still has
+   it. The replaced structures are returned and dropped *after* the lock is
+   released. A stale ticket (e.g. an in-place `rebuild_from_batch` ran
+   meanwhile, which cancels the in-flight rebuild) installs nothing.
+
+The delta replay is not optional: every write path calls `graph.add_memory`
+*before* the store write, so without it any share landing during a
+50-second build would silently vanish from the graph at swap time.
+
+Both serving sites call it: the optimize action through `spawn_rebuild`, a
+**detached** `tokio::spawn` the handler merely awaits — Cloud Scheduler's
+HTTP deadline is shorter than a 60k build, and a disconnect drops the
+handler future; the rebuild must neither be wasted nor wedge the marker. An
+`AbortOnDrop` guard releases the marker on panic or cancellation. The
+sparsifier now follows through the P3 off-lock path at both sites (the
+optimize action previously ran `rebuild_sparsifier` inline under the write
+lock with no size gate — a second heavy op at the same site). The
+post-hydration path caps it at the same `<= 5_000_000` edges as `main.rs`'s
+background task; the optimize action keeps its old "always" behaviour.
+`rebuild_from_batch` survives as a thin build-then-swap wrapper for the
+offline worker binary and tests, documented as not for serving paths. The
+log line `Graph rebuilt from batch (ADR-149 P3)` is kept verbatim (with
+`build_ms`, `threads`, `install_ms`, `replayed_*` fields added) because ops
+correlate 504 bursts against it.
+
+**Semantics are exact, not approximate.** Same nodes, same positions (input
+order), same edges in the same `(i, j)` order, bitwise-identical `f64`
+weights. The edge pass is cheaper only because each vector's norm is
+computed once, with *exactly* the accumulation order `cosine_similarity`
+uses, so `dot / (|a|·|b|)` is the same double (Rust does not contract to
+FMA). Tests assert edge-for-edge bit equality against the verbatim old loop,
+sequential and parallel. The pass is split into contiguous, pair-balanced
+row ranges over `std::thread::scope` (no new dependency); concatenating them
+in order reproduces the sequential edge order. Threads default to
+`available_parallelism() - 1` (overridable via `GRAPH_REBUILD_THREADS`) so
+one core is always left for serving — **on Cloud Run's `--cpu=2` that is one
+build thread**, so the production wall time is the `threads=1` row below.
+
+**Approximate kNN via HNSW was considered and not implemented.** It would
+turn a similarity-*threshold* graph into a *k-nearest* graph — a different
+edge set and different PPR/partition results — to buy wall time. Once the
+build is off-lock, wall time is no longer what causes 504s; request latency
+is. So no approximate variant exists and no recall figure is claimed. If
+the corpus grows until even the off-lock build is a CPU problem on 2 vCPU
+(~O(n²): 60k → 50 s single-threaded; 200k would be ~9 min), that is the
+point to revisit, with a recall check against this exact builder.
+
+**Measurements** (release, `rebuild_benchmark`, `#[ignore]`d; synthetic
+clustered L2-normalised embeddings at the live `EMBED_DIM = 128`, cluster
+size 40 so the 60k graph has 1.15M edges ≈ the live ~1.2M; 2 OS reader
+threads each doing `graph.read()` + `ranked_search(q, 10)` in a loop; 32-core
+dev box under load average ~8–17 from other jobs, so treat absolute numbers
+as indicative):
+
+| n | path | rebuild wall | read p50 | read p99 | read max | reads served |
+|---|---|---|---|---|---|---|
+| 10k | idle (no rebuild) | — | 1.8 ms | 2.6 ms | 3.2 ms | 1541 / 3 s |
+| 10k | **old** (under write lock) | 2.58 s | — | 2.58 s | 2.58 s | 54 |
+| 10k | new, 1 thread | 1.26 s | 1.9 ms | 2.9 ms | 8.0 ms | 684 (634 during build) |
+| 10k | new, 31 threads | 0.12 s | 1.9 ms | 7.9 ms | 8.2 ms | 89 |
+| 60k | idle (no rebuild) | — | 24.5 ms | 29.2 ms | 29.4 ms | 228 / 3 s |
+| 60k | **old** (under write lock) | **96.4 s** | — | **96.4 s** | **96.4 s** | 12 |
+| 60k | **new, 1 thread (= Cloud Run)** | **50.7 s** | 28.1 ms | **31.1 ms** | **55.2 ms** | 3378 (3370 during build) |
+| 60k | new, 31 threads | 3.9 s | 74.8 ms | 108.8 ms | 110.9 ms | 109 |
+
+- With the old path every read that arrived during the rebuild waited for
+  all of it: at 60k that is 96 s, over Cloud Run's request timeout — the
+  504 storm. With P5, reads during the rebuild are within noise of idle; the
+  60k max of 55 ms is the first search after the swap synchronously
+  rebuilding the 1.15M-edge CSR (P2's documented, deliberate behaviour).
+- The write lock is held for the swap only: 0.3–0.8 µs measured inside
+  `install_batch` (no concurrent mutations to replay in the bench; each
+  replayed add costs one O(n) `add_memory`).
+- The 31-thread rows show the CPU-contention trade-off the `-1` default
+  guards against: reads slow (not block) when the build saturates cores.
+- Wall time at 1 thread is ~1.9x faster than old from the hoisted norms.
+
+Every new test was confirmed to fail against the code it protects:
+
+| Test | Verified by |
+|---|---|
+| `reads_stay_responsive_during_rebuild_and_result_is_exact` (3k nodes, 2 reader threads, each read < 200 ms, reads overlap the build, final graph = exact rebuild + the mid-build add) | taking `graph.write()` inside the build closure (the old behaviour) → fails |
+| `mutations_during_build_are_replayed` | removing the replay loop → fails (so does the test above) |
+| `cancelled_rebuild_releases_the_marker` | disabling `AbortOnDrop` → fails |
+| `begin_rebuild_is_single_flight`, `concurrent_rebuilds_are_single_flight` | removing the in-flight check → both fail |
+| `install_batch_invalidates_an_in_flight_sparsifier_build` | removing the `index_generation` bump from the swap → fails |
+| `build_batch_matches_reference_exactly_sequential_and_parallel`, `prenormed_cosine_is_bitwise_identical` | bit-equality (weights via `to_bits`) against the verbatim old loop at 1/2/3/8 threads, incl. a zero vector and a wrong-dimension vector |
+
+**Single-flight vs. cold start is safe to skip.** `/v1/pipeline/optimize` sits behind `check_read_only`, which (since #1022) refuses while `store.is_hydrated()` is false, so a scheduler-triggered rebuild can only begin after hydration completed and therefore snapshots the complete store. If the post-hydration rebuild then gets `AlreadyRunning`, the in-flight rebuild is already building from a full snapshot; nothing is lost. Conversely, when the optimize action finds the post-hydration rebuild in flight it reports the action as succeeded-and-skipped (`true`), not as a failure. Optimize runs themselves were already serialised by `optimize_semaphore` (a second concurrent run gets 429), so the simultaneous 03:00 firing of `brain-graph` and `brain-full-optimize` behaves as before.
+
+**Transient memory.** The old code cleared the graph before rebuilding; P5 keeps the old graph serving while the snapshot and the new build exist, so all three coexist for the build duration — roughly +80 MB at 60k nodes / 1.2M edges (memory clones, second node map with embeddings, second edge Vec) on a 4 GiB instance. Estimated from sizes, not measured.
+
+**Pre-existing race, not widened:** because writes hit the graph before the
+store, a memory whose `graph.add_memory` lands *before* `begin_rebuild` and
+whose store write lands *after* the snapshot is absent from the new graph.
+The old code had the same window (between `all_memories()` and acquiring
+`graph.write()`); P5's is no wider. Removals are ordered store-first, so a
+removal cannot resurrect a node through this path.
 
 ## Consequences
 
@@ -415,7 +531,7 @@ sparsifier build refuses to install.
 - `/v1/pipeline/inject` may 401 for its unidentified `curl` caller until a
   header is added.
 
-**No performance figure is claimed anywhere in this change.** No benchmark was
+**No performance figure is claimed for P0–P4.** (P5, item 6, carries its own measurements.) No benchmark was
 run. Every claim is about lock structure or asymptotic shape, both readable
 from the code. Anything phrased as a speedup would be invented.
 
@@ -425,7 +541,8 @@ Baseline before any edit, so pre-existing and introduced failures could not be
 confused: `cargo fmt --check` clean, 146 tests passing,
 `cargo clippy --all-targets --all-features -- -D warnings` clean. After:
 **166 unit tests plus 1 doctest passing**, fmt and clippy still clean on the
-final commit.
+final commit. After P5 (item 6): **181 unit tests plus 1 doctest passing**, fmt clean,
+`cargo clippy -p mcp-brain-server --no-deps --all-targets -- -D warnings` clean.
 
 Every new test was confirmed to **fail** against the code it protects:
 
