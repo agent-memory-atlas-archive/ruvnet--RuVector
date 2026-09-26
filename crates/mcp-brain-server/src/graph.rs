@@ -51,7 +51,16 @@ pub struct KnowledgeGraph {
     /// position even when the memory set is identical (it iterates a DashMap,
     /// whose order is arbitrary).
     index_generation: u64,
+    /// Mutations recorded while an off-lock rebuild is in flight (ADR-349
+    /// item 6). `Some` doubles as the single-flight marker: `begin_rebuild`
+    /// refuses while it is set. See `graph/rebuild.rs`.
+    rebuild_log: Option<rebuild::RebuildLog>,
+    /// Monotonic id handed to each `begin_rebuild`, so an install or abort
+    /// from a superseded rebuild can never touch a newer one.
+    rebuild_seq: u64,
 }
+
+pub mod rebuild;
 
 struct GraphNode {
     embedding: Vec<f32>,
@@ -81,115 +90,39 @@ impl KnowledgeGraph {
             csr_build: parking_lot::Mutex::new(()),
             sparsifier: None,
             index_generation: 0,
+            rebuild_log: None,
+            rebuild_seq: 0,
         }
     }
 
-    /// Rebuild the entire graph from a batch of memories (ADR-149 P3).
+    /// Rebuild the entire graph from a batch of memories (ADR-149 P3), in
+    /// place, with `&mut self` held for the whole O(n²) edge pass.
     ///
-    /// Much faster than adding one at a time because:
-    /// 1. All nodes inserted first (no per-insert similarity scan)
-    /// 2. All-pairs similarity computed in a single pass (cache-friendly)
-    /// 3. Edges collected and stored in one allocation
+    /// **Do not call this from a request-serving path.** At the live ~60k
+    /// nodes it holds whatever lock guards `self` for the full all-pairs
+    /// build, which is exactly the ADR-349 item-6 504 mechanism. Serving code
+    /// uses [`rebuild::spawn_rebuild`], which builds off-lock and swaps the
+    /// result in under a brief write lock. This entry point remains for the
+    /// offline worker binary and for tests, where nothing else is waiting.
     ///
-    /// On cold start with ~10K memories this avoids ~53M sequential similarity
-    /// checks done incrementally (the i-th add_memory scans i-1 nodes) and
-    /// instead performs them in a tight loop over contiguous embedding slices.
+    /// Produces exactly the same nodes, positions, edges and edge order as
+    /// the off-lock path (both go through [`KnowledgeGraph::build_batch`]).
+    /// Cancels any off-lock rebuild that is in flight: its snapshot predates
+    /// this one, so its install is refused.
     pub fn rebuild_from_batch(&mut self, memories: &[BrainMemory]) {
-        self.nodes.clear();
-        self.edges.clear();
-        self.node_ids.clear();
-        self.node_index.clear();
-        self.mark_csr_dirty();
-        self.mincut = None;
-        self.sparsifier = None;
-        // Every node position is about to be reassigned.
-        self.index_generation = self.index_generation.wrapping_add(1);
-
-        let n = memories.len();
-        if n == 0 {
-            return;
-        }
-
-        // Pre-allocate
-        self.nodes.reserve(n);
-        self.node_ids.reserve(n);
-        self.node_index.reserve(n);
-        // Heuristic: ~20 edges per node on average
-        self.edges.reserve(n * 20);
-
-        // 1. Insert all nodes and collect quality scores
-        let mut qualities = Vec::with_capacity(n);
-        for (idx, m) in memories.iter().enumerate() {
-            let quality = m.quality_score.mean();
-            let node = GraphNode {
-                embedding: m.embedding.clone(),
-                category: m.category.clone(),
-                quality,
-            };
-            self.nodes.insert(m.id, node);
-            self.node_index.insert(m.id, idx);
-            self.node_ids.push(m.id);
-            qualities.push(quality);
-        }
-
-        // ADR-149 P2: quality floor for edge building (same as add_memory)
-        const EDGE_QUALITY_FLOOR: f64 = 0.01;
-
-        // 2. Collect embeddings as slices for cache-friendly access
-        //    (avoids HashMap lookups in the hot loop)
-        let embeddings: Vec<&[f32]> = memories.iter().map(|m| m.embedding.as_slice()).collect();
-        let threshold = self.similarity_threshold;
-
-        // Early-exit heuristic DISABLED.
-        // After L2 pre-normalization (ADR-149 followup), the partial-dot
-        // shortcut rejected too many real edges — graph collapsed from 38M
-        // to 81 edges. The full cosine is cheap enough (4x unrolled, auto-
-        // vectorized) that the early-exit wasn't saving meaningful compute.
-        let dim = embeddings.first().map(|e| e.len()).unwrap_or(0);
-        let prefix = 0usize; // disable
-        let early_exit_bound = -1.0; // always pass
-        let _ = (dim, early_exit_bound); // suppress unused warnings
-
-        // 3. Compute all edges in a single pass — O(n^2/2) pairs
-        for i in 0..n {
-            // Skip low-quality source nodes
-            if qualities[i] < EDGE_QUALITY_FLOOR {
-                continue;
-            }
-            let emb_i = embeddings[i];
-            for j in (i + 1)..n {
-                // Skip low-quality target nodes
-                if qualities[j] < EDGE_QUALITY_FLOOR {
-                    continue;
-                }
-                let emb_j = embeddings[j];
-
-                // Early-exit: cheap partial dot product on first `prefix` dims
-                if prefix > 0 {
-                    let quick_dot: f64 = emb_i[..prefix]
-                        .iter()
-                        .zip(&emb_j[..prefix])
-                        .map(|(a, b)| (*a as f64) * (*b as f64))
-                        .sum();
-                    if quick_dot < early_exit_bound {
-                        continue;
-                    }
-                }
-
-                let sim = cosine_similarity(emb_i, emb_j);
-                if sim >= threshold {
-                    self.edges.push(GraphEdge {
-                        source: memories[i].id,
-                        target: memories[j].id,
-                        weight: sim,
-                    });
-                }
-            }
-        }
-
+        self.rebuild_log = None;
+        let build = Self::build_batch(
+            memories,
+            self.similarity_threshold,
+            rebuild::default_build_threads(),
+        );
+        let (retired, stats) = self.swap_in_batch(build);
+        drop(retired);
         tracing::info!(
             nodes = self.nodes.len(),
             edges = self.edges.len(),
+            build_ms = stats.elapsed.as_millis() as u64,
+            threads = stats.threads,
             "Graph rebuilt from batch (ADR-149 P3)"
         );
     }
@@ -202,6 +135,18 @@ impl KnowledgeGraph {
             category: memory.category.clone(),
             quality,
         };
+        // An off-lock rebuild is building from a snapshot that may not include
+        // this memory; record it so the install can replay it (ADR-349 #6).
+        if let Some(log) = self.rebuild_log.as_mut() {
+            log.record_add(memory.id, &new_node);
+        }
+        self.add_node(memory.id, new_node);
+    }
+
+    /// Insert one node and its similarity edges. Shared by `add_memory` and
+    /// the rebuild-install replay; does not touch the rebuild log.
+    fn add_node(&mut self, id: Uuid, new_node: GraphNode) {
+        let memory_id = id;
 
         // ADR-149 P2: quality floor for edge building — skip low-quality nodes
         // to reduce noisy edges and speed up graph operations.
@@ -217,7 +162,7 @@ impl KnowledgeGraph {
             let sim = cosine_similarity(&new_node.embedding, &existing_node.embedding);
             if sim >= self.similarity_threshold {
                 new_edges.push(GraphEdge {
-                    source: memory.id,
+                    source: memory_id,
                     target: *existing_id,
                     weight: sim,
                 });
@@ -236,9 +181,9 @@ impl KnowledgeGraph {
             }
         }
 
-        self.nodes.insert(memory.id, new_node);
-        self.node_index.insert(memory.id, new_idx);
-        self.node_ids.push(memory.id);
+        self.nodes.insert(memory_id, new_node);
+        self.node_index.insert(memory_id, new_idx);
+        self.node_ids.push(memory_id);
 
         // Update sparsifier with new edges (ADR-116)
         if let Some(ref mut spar) = self.sparsifier {
@@ -257,6 +202,17 @@ impl KnowledgeGraph {
 
     /// Remove a memory from the graph
     pub fn remove_memory(&mut self, id: &Uuid) {
+        // The in-flight rebuild's snapshot may still contain this memory;
+        // record the removal so the install can replay it (ADR-349 #6).
+        if let Some(log) = self.rebuild_log.as_mut() {
+            log.record_remove(*id);
+        }
+        self.remove_node(id);
+    }
+
+    /// Remove one node and its edges. Shared by `remove_memory` and the
+    /// rebuild-install replay; does not touch the rebuild log.
+    fn remove_node(&mut self, id: &Uuid) {
         // Collect edges to delete from sparsifier before removing them
         if let Some(ref mut spar) = self.sparsifier {
             if let Some(&u_pos) = self.node_index.get(id) {
