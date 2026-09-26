@@ -284,3 +284,47 @@ fn export_import_bank_round_trips_the_decision() {
     assert_eq!(a, b, "an imported bank reproduces the exporter's decision");
     assert_eq!(dst.bank_summary().total, src.bank_summary().total);
 }
+
+fn noul_rows(n: usize, tag: &str) -> Vec<LabeledExample> {
+    (0..n)
+        .map(|i| LabeledExample {
+            text: format!("{tag} ticket number {i}"),
+            label: if i % 2 == 0 { "yes" } else { "no" }.into(),
+        })
+        .collect()
+}
+
+#[test]
+fn explicit_calibration_replaces_the_positional_carve() {
+    // Without an explicit slice: every 5th Train row is carved out.
+    let mut plain = Engine::new(HashEmbedder::new(DIMS));
+    plain.train("u", &noul_rows(25, "train")).unwrap();
+    let (tr, ca) = plain.noul_split_for("u");
+    assert_eq!((tr.len(), ca.len()), (20, 5));
+
+    // With one: all Train rows train, exactly the supplied rows calibrate.
+    let mut split = Engine::new(HashEmbedder::new(DIMS));
+    let report = split
+        .train_with_calibration("u", &noul_rows(25, "train"), &noul_rows(7, "calib"))
+        .unwrap();
+    assert_eq!(report.accepted, 32);
+    let (tr, ca) = split.noul_split_for("u");
+    assert_eq!((tr.len(), ca.len()), (25, 7));
+    // Other questions keep the carve.
+    split.train("v", &noul_rows(10, "other")).unwrap();
+    let (tr, ca) = split.noul_split_for("v");
+    assert_eq!((tr.len(), ca.len()), (8, 2));
+}
+
+#[test]
+fn empty_calibration_is_bit_identical_to_plain_train() {
+    let mut one = Engine::new(HashEmbedder::new(DIMS));
+    one.train("q", &build_probe_training()).unwrap();
+    let mut two = Engine::new(HashEmbedder::new(DIMS));
+    two.train_with_calibration("q", &build_probe_training(), &[])
+        .unwrap();
+    let req = two_topic_request("storm rain and football goal");
+    let a = serde_json::to_string(&one.decide(&req).unwrap()).unwrap();
+    let b = serde_json::to_string(&two.decide(&req).unwrap()).unwrap();
+    assert_eq!(a, b);
+}

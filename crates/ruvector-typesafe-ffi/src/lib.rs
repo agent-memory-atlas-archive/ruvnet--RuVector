@@ -99,6 +99,19 @@ struct TrainInput {
     question: String,
     #[serde(default)]
     examples: Vec<ExampleInput>,
+    /// Optional held-out calibration slice (ADR-007 §4); when non-empty the
+    /// head calibrates on exactly these rows instead of a carve of `examples`.
+    #[serde(default)]
+    calibration: Vec<ExampleInput>,
+}
+
+fn to_labeled(rows: Vec<ExampleInput>) -> Vec<LabeledExample> {
+    rows.into_iter()
+        .map(|e| LabeledExample {
+            text: e.text,
+            label: e.label,
+        })
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -213,16 +226,15 @@ impl Engine {
             Ok(v) => v,
             Err(e) => return invalid_json(&format!("train JSON parse error: {e}")),
         };
-        let examples: Vec<LabeledExample> = input
-            .examples
-            .into_iter()
-            .map(|e| LabeledExample {
-                text: e.text,
-                label: e.label,
-            })
-            .collect();
+        let examples = to_labeled(input.examples);
+        let calibration = to_labeled(input.calibration);
         let mut guard = self.inner.write().unwrap_or_else(|p| p.into_inner());
-        match guard.train(&input.question, &examples) {
+        let result = if calibration.is_empty() {
+            guard.train(&input.question, &examples)
+        } else {
+            guard.train_with_calibration(&input.question, &examples, &calibration)
+        };
+        match result {
             Ok(report) => {
                 serde_json::to_string(&report).unwrap_or_else(|e| embedder_json(&e.to_string()))
             }

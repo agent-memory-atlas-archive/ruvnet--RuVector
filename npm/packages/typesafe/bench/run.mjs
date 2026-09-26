@@ -11,7 +11,9 @@
 //                      [--gate] [--report-only] [--baseline-receipt PATH]
 //                      [--model NAME] [--model-dir DIR] [--manifest PATH]
 //                      [--train-hashes PATH] [--no-test] [--emit-records PATH]
-//
+//                      [--no-calibration-split]
+// Tickets calibrate on the fixture's held-out `calibration` split (ADR-007 §4);
+// --no-calibration-split restores the engine's positional carve (pre-v1).
 // ONNX arms resolve to ONE sha256-verified manifest entry (lib/model-dir.mjs);
 // --model-dir may point at a staged candidate or a bare unpublished dir. A model
 // that ships train-text-hashes.txt (or --train-hashes) is leakage-checked
@@ -36,6 +38,7 @@ import { resolveLocalContext } from './lib/model-dir.mjs';
 import { leakageGate } from './lib/leakage.mjs';
 import { evaluateGates, gatesTable, loadGates } from './lib/gates.mjs';
 import { loadDataset } from './datasets/index.mjs';
+import { validationView, heldoutUnion } from './lib/public-val.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = join(HERE, '..');
@@ -76,6 +79,7 @@ export function parseArgs(argv) {
     else if (t === '--no-test') a.noTest = true;
     else if (t === '--train-hashes') a.trainHashes = next();
     else if (t === '--emit-records') a.emitRecords = next();
+    else if (t === '--no-calibration-split') a.noCalibrationSplit = true;
     else throw new Error(`unknown flag: ${t}`);
   }
   return a;
@@ -199,7 +203,9 @@ async function runTickets(args, deps, ctx = {}) {
         source: resolved.source,
       };
       if (args.regime === 'few-shot') {
-        training = trainTicketQuestions(engine, trainPool.trainItems, tickets.questions, { shots: args.shots });
+        const calibrationItems = args.noCalibrationSplit ? undefined : tickets.bySplit.calibration;
+        training = trainTicketQuestions(engine, trainPool.trainItems, tickets.questions, { shots: args.shots, calibrationItems });
+        training.calibrationSource = calibrationItems ? 'fixture-calibration-split' : 'engine-carve';
         training.excludedHeldOutTexts = trainPool.excluded;
       }
       // test needs limit-subsetting to match jev's id set; other splits full.
@@ -270,7 +276,6 @@ export async function main(argv, deps = {}) {
   if (args.noTest && args.emitRecords) throw new Error('--emit-records writes test records; it cannot be combined with --no-test');
   if (args.emitRecords && suites.length !== 1) throw new Error('--emit-records needs a single --suite');
   if (args.noTest && args.arm === 'jev') throw new Error('--no-test with --arm jev scores nothing (the jev arm is test-only)');
-  if (args.noTest && suites.some((x) => x !== 'tickets')) throw new Error('--no-test applies to --suite tickets only (public suites have no validation split)');
   const ctx = resolveLocalContext(args);
   const fixtureHashes = verifyFixtureHashes({
     benchDir: deps.benchDir ?? BENCH_DIR,
@@ -363,7 +368,6 @@ export async function main(argv, deps = {}) {
 }
 
 async function runDataset(suite, args, deps, ctx = {}) {
-  if (args.noTest) throw new Error(`--no-test: suite '${suite}' has only train/test splits — nothing to score without test`);
   const ds = await (deps.loadDataset ?? loadDataset)(suite, { limit: args.limit, cacheDir: deps.cacheDir });
   if (ds.skipped) return { skipped: ds.skipped };
   // Dataset items carry a flat string `label`; normalise to the tickets item
@@ -373,8 +377,12 @@ async function runDataset(suite, args, deps, ctx = {}) {
     id: it.id, text: it.text, label: { intent: it.label },
     oos: typeof it.oos === 'boolean' ? it.oos : undefined,
   });
-  const trainItems = (ds.trainItems ?? []).map(shape);
+  // --no-test: the exporter's validation slice (lib/public-val.mjs); test is hashed only.
+  const view = args.noTest ? validationView(suite, ds, await heldoutUnion(deps.loadDataset ?? loadDataset, { cacheDir: deps.cacheDir })) : null;
+  const trainItems = (view ? view.trainItems : ds.trainItems ?? []).map(shape);
   const testItems = (ds.testItems ?? []).map(shape);
+  const split = view ? 'validation' : 'test';
+  const evalItems = view ? view.evalItems.map(shape) : testItems;
   // Assertion B before any engine is built (public suites: the test split).
   const leakage = leakageGate(ctx.trainHashes, { test: testItems });
   // Non-tickets suites have no frozen Jev baseline: local arm only.
@@ -390,18 +398,18 @@ async function runDataset(suite, args, deps, ctx = {}) {
     if (args.regime === 'few-shot' && trainItems.length) {
       training = trainFewShot(engine, trainItems, { shots: args.shots, question: 'intent', labelKey: 'intent' });
     }
-    const res = runLocal(engine, testItems, ds.questions, { labelKey: 'intent' });
+    const res = runLocal(engine, evalItems, ds.questions, { labelKey: 'intent' });
     if (!res.available) localUnavailable = res.error;
     else {
-      metrics.local = { test: scoreRecords(res.records, { departments: ds.labels, wallMs: res.wallMs }) };
-      itemRecords = { local: { test: toItemRecords(res.records, { choiceKey: 'intent' }) } };
+      metrics.local = { [split]: scoreRecords(res.records, { departments: ds.labels, wallMs: res.wallMs }) };
+      itemRecords = { local: { [split]: toItemRecords(res.records, { choiceKey: 'intent' }) } };
     }
     stats = readStats(engine);
   }
   return {
     suite,
     departments: ds.labels,
-    counts: ds.counts,
+    counts: view ? { ...ds.counts, ...view.counts } : ds.counts,
     splitsHash: ds.splitsHash ?? null,
     questions: ds.questions,
     metrics,

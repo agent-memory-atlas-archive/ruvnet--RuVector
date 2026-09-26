@@ -33,12 +33,18 @@ export async function load({ limit, cacheDir } = {}) {
   const labels = [...new Set(trainItems.map((i) => i.label))].sort();
   const criteria = Object.fromEntries(labels.map((l) => [l, humaniseLabel(l)]));
   const testItems = [...inScope, ...oosItems];
+  // Official validation (selection runs only, run.mjs --no-test; lib/public-val.mjs).
+  const valItems = [
+    ...toItems(data.val, 'clinc-va').map((it) => ({ ...it, oos: false })),
+    ...toItems(data.oos_val, 'clinc-oosva').map((it) => ({ ...it, label: 'oos', oos: true })),
+  ];
 
   return {
     labels,
     questions: choiceQuestion(criteria, 'Which assistant intent does this utterance express'),
     trainItems,
     testItems,
+    valItems,
     inScopeItems: inScope,
     oosItems,
     counts: { train: trainItems.length, test_in_scope: inScope.length, test_oos: oosItems.length, labels: labels.length },
