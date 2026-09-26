@@ -62,7 +62,8 @@ t0=$(date +%s)
 stamp() { echo "{\"stage\":\"$1\",\"seconds\":$(( $(date +%s) - t0 ))}" >> "$ART/logs/stages.jsonl"; }
 
 # ---- 0. preflight: glibc >= 2.38 (see header) --------------------------------
-GLIBC="$(ldd --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+$' || echo 0)"
+GLIBC="$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}')"
+[ -n "$GLIBC" ] || GLIBC=0
 if [ "$(printf '%s\n' 2.38 "$GLIBC" | sort -V | head -1)" != 2.38 ]; then
   echo "glibc $GLIBC < 2.38: ort's prebuilt onnxruntime will not link; use an Ubuntu 24.04 image (see header)" >&2
   exit 2
