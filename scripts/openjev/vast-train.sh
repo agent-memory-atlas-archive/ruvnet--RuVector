@@ -59,11 +59,13 @@ stamp() { echo "{\"stage\":\"$1\",\"seconds\":$(( $(date +%s) - t0 ))}" >> "$ART
 
 # ---- 1. toolchain -----------------------------------------------------------
 if [ -z "${OPENJEV_BIN:-}" ]; then
-  if ! command -v cc >/dev/null || ! command -v pkg-config >/dev/null; then
-    log "installing build-essential"
+  # libssl-dev: ort-sys's build script downloads onnxruntime via ureq/native-tls
+  # (openssl-sys); the nvidia/cuda devel image does not ship the headers.
+  if ! command -v cc >/dev/null || ! command -v pkg-config >/dev/null || ! pkg-config --exists openssl; then
+    log "installing build-essential pkg-config libssl-dev"
     apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-      build-essential pkg-config ca-certificates curl git >/dev/null
+      build-essential pkg-config libssl-dev ca-certificates curl git >/dev/null
   fi
   if ! command -v cargo >/dev/null; then
     log "installing rust $RUST_TOOLCHAIN"
