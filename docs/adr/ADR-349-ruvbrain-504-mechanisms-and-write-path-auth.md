@@ -506,6 +506,10 @@ Every new test was confirmed to fail against the code it protects:
 | `install_batch_invalidates_an_in_flight_sparsifier_build` | removing the `index_generation` bump from the swap → fails |
 | `build_batch_matches_reference_exactly_sequential_and_parallel`, `prenormed_cosine_is_bitwise_identical` | bit-equality (weights via `to_bits`) against the verbatim old loop at 1/2/3/8 threads, incl. a zero vector and a wrong-dimension vector |
 
+**Single-flight vs. cold start is safe to skip.** `/v1/pipeline/optimize` sits behind `check_read_only`, which (since #1022) refuses while `store.is_hydrated()` is false, so a scheduler-triggered rebuild can only begin after hydration completed and therefore snapshots the complete store. If the post-hydration rebuild then gets `AlreadyRunning`, the in-flight rebuild is already building from a full snapshot; nothing is lost. Conversely, when the optimize action finds the post-hydration rebuild in flight it reports the action as succeeded-and-skipped (`true`), not as a failure. Optimize runs themselves were already serialised by `optimize_semaphore` (a second concurrent run gets 429), so the simultaneous 03:00 firing of `brain-graph` and `brain-full-optimize` behaves as before.
+
+**Transient memory.** The old code cleared the graph before rebuilding; P5 keeps the old graph serving while the snapshot and the new build exist, so all three coexist for the build duration — roughly +80 MB at 60k nodes / 1.2M edges (memory clones, second node map with embeddings, second edge Vec) on a 4 GiB instance. Estimated from sizes, not measured.
+
 **Pre-existing race, not widened:** because writes hit the graph before the
 store, a memory whose `graph.add_memory` lands *before* `begin_rebuild` and
 whose store write lands *after* the snapshot is absent from the new graph.
@@ -537,7 +541,8 @@ Baseline before any edit, so pre-existing and introduced failures could not be
 confused: `cargo fmt --check` clean, 146 tests passing,
 `cargo clippy --all-targets --all-features -- -D warnings` clean. After:
 **166 unit tests plus 1 doctest passing**, fmt and clippy still clean on the
-final commit.
+final commit. After P5 (item 6): **181 unit tests plus 1 doctest passing**, fmt clean,
+`cargo clippy -p mcp-brain-server --no-deps --all-targets -- -D warnings` clean.
 
 Every new test was confirmed to **fail** against the code it protects:
 

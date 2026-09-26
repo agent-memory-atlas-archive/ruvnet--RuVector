@@ -4160,9 +4160,14 @@ async fn pipeline_optimize(
                         true,
                         format!("Graph rebuilt: {} nodes, {} edges", r.nodes, r.edges),
                     ),
-                    Ok(RebuildOutcome::AlreadyRunning) => {
-                        (false, "Graph rebuild already in progress; skipped".into())
-                    }
+                    Ok(RebuildOutcome::AlreadyRunning) => (
+                        // Only the post-hydration rebuild can be in flight here
+                        // (optimize_semaphore serialises optimize runs), and it
+                        // snapshots a complete store, so the graph is being
+                        // rebuilt: report success, not a failed run.
+                        true,
+                        "Graph rebuild already in progress (post-hydration); skipped".into(),
+                    ),
                     Ok(RebuildOutcome::Superseded) => {
                         (false, "Graph rebuild superseded by a newer rebuild".into())
                     }
