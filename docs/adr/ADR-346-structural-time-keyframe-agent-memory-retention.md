@@ -90,14 +90,25 @@ process runs cross-checked for determinism).
 
 | Gate | Threshold | Measured | Result |
 |---|---|---|---|
-| B2 survival-rate gap vs. tick-recency baseline | ≥ +15pp | +25.0pp (35.0% vs 10.0%) | PASS |
-| B2 survival-rate gap vs. fair dedup baseline | (reported, not gating) | +22.5pp (35.0% vs 12.5%) | edge over fair baseline |
+| B2 survival-rate gap vs. tick-recency baseline (`CoherencePolicy`) | ≥ +15pp | +25.0pp (35.0% vs 10.0%) | PASS |
+| B2 survival-rate gap vs. fair dedup baseline (`DedupGatedRecency`, new) | (reported, not gating) | +22.5pp (35.0% vs 12.5%) | edge over fair baseline |
 | B2 Recall@10 delta (50% compaction, production weights) | ≥ −3pp | −0.5pp (99.5% vs 100.0%) | PASS |
-| B2 compaction slowdown vs. baseline | ≤ 20x | 2.7x – 3.3x (Exp. 1 and 2) | PASS |
+| B2 compaction slowdown vs. baseline | ≤ 20x | 2.4x – 4.7x (Exp. 1 and 2) | PASS |
 | B2 determinism (3 independent process runs) | identical | identical | PASS |
 | B1 (score-based) survival-rate gap vs. baseline | — | +0.0pp | negative result, informative |
+| B2 vs. `LruPolicy` (pre-existing `ruvector-agent-memory` policy) | (reported) | +25.0pp survival | edge over existing policy |
+| B2 vs. `LfuPolicy` (pre-existing `ruvector-agent-memory` policy) | (reported) | +22.5pp survival | edge over existing policy |
+| B2 via `compact_witnessed` (audited path, ADR-345) | witness chain verifies | 320/320 evictions witnessed, chain verifies | PASS |
 
 **Overall acceptance: ACCEPT.**
+
+Every measured comparison above runs against a *pre-existing* RuVector
+implementation: `CoherencePolicy` (the crate's established default,
+2026-06-14 nightly), and `LruPolicy`/`LfuPolicy` (the crate's original two
+classical policies, predating `CoherencePolicy` itself). `DedupGatedRecency`
+is the one new baseline this nightly introduces, added specifically to rule
+out a strawman win over the *existing* policies, not as a substitute for
+comparing against them — B2 is reported against both.
 
 ### Why B1 (score-based) fails and B2 (keyframe-based) works
 
@@ -237,3 +248,13 @@ implementation that motivated B2, not deleted.
   survival-rate/performance tradeoff, given ADR-345's cost findings?
 - Is there a principled way to fix the exact-duplicate-tail trimming corner
   case beyond documenting it?
+- `ruvector-agent-memory` has no consumer crate today — no other crate in the
+  workspace depends on it, and `compact()`/`compact_witnessed()` are only
+  called from this crate's own examples and tests. This ADR verified
+  `StructuralKeyframeRetention` works as a drop-in `CompactionPolicy` through
+  the crate's most production-shaped entry point (`compact_witnessed`, the
+  audited path), which is the full extent of "integration" available inside
+  this crate's own boundary; there is no separate downstream system to wire
+  it into until one exists. Identifying (or building) that first real
+  consumer is a prerequisite for any promotion decision beyond this
+  feature-gated, opt-in state.

@@ -44,15 +44,30 @@
 //! not a fair cheap baseline has not demonstrated an edge worth its extra
 //! dependency.
 //!
+//! `LruPolicy` and `LfuPolicy` — the two classical, pre-existing
+//! `ruvector-agent-memory` compaction policies (predating this nightly and
+//! `CoherencePolicy` itself) — are also run in both experiments, so every
+//! candidate here is measured against RuVector's actual existing
+//! implementations, not only against `DedupGatedRecency`, the new baseline
+//! this nightly introduces specifically to rule out a strawman comparison.
+//!
+//! `verify_witnessed_integration` additionally runs `StructuralKeyframeRetention`
+//! through `compact_witnessed` — the crate's audited, "no witness, no
+//! mutation" compaction entry point (ADR-345) — instead of the bare `compact`
+//! helper, and checks the emitted eviction-witness chain verifies. Every
+//! `CompactionPolicy` in this crate, including both new ones, is generic over
+//! that same audited path; there is no separate "production" compaction
+//! pipeline to special-case.
+//!
 //! Run:
 //!   cargo run --release -p ruvector-agent-memory --example structural_time_recency_bench --features structural-time
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use ruvector_agent_memory::{
-    compact, recall_at_k, CoherencePolicy, CoherenceWeights, CompactionPolicy, DedupGatedRecency,
-    DedupGatedWeights, MemoryStore, StructuralKeyframeRetention, StructuralTimeRecency,
-    StructuralTimeWeights,
+    compact, compact_witnessed, recall_at_k, CoherencePolicy, CoherenceWeights, CompactionPolicy,
+    DedupGatedRecency, DedupGatedWeights, EvictionWitnessChain, LfuPolicy, LruPolicy, MemoryStore,
+    MemoryWitnessLog, StructuralKeyframeRetention, StructuralTimeRecency, StructuralTimeWeights,
 };
 use std::time::{Duration, Instant};
 
@@ -192,6 +207,56 @@ fn run_experiment2(policy: &dyn CompactionPolicy, seed: u64) -> (f32, Duration) 
     (total / queries.len() as f32, elapsed)
 }
 
+/// Run `StructuralKeyframeRetention` through `compact_witnessed` — the
+/// crate's audited "no witness, no mutation" compaction entry point
+/// (ADR-345) — instead of the bare `compact` helper used elsewhere in this
+/// benchmark, and verify the emitted eviction-witness chain checks out.
+/// Demonstrates that the new policy is a drop-in `CompactionPolicy` for the
+/// crate's most production-hardened path, not only its own example binary.
+fn verify_witnessed_integration(seed: u64) -> bool {
+    let dataset = generate_dataset(seed);
+    let mut store = dataset.store;
+    let policy = StructuralKeyframeRetention::default();
+    let mut chain = EvictionWitnessChain::new();
+    let mut log = MemoryWitnessLog::default();
+
+    let records = compact_witnessed(
+        &mut store,
+        &policy,
+        TARGET_SIZE_H1,
+        &[],
+        "structural-time-recency-bench",
+        1_726_000_000_000,
+        &mut chain,
+        &mut log,
+    )
+    .expect("compact_witnessed should accept StructuralKeyframeRetention");
+
+    let survived = store.len() == TARGET_SIZE_H1;
+    let evicted_count_ok = records.len() == N_MEMORIES - TARGET_SIZE_H1;
+    let chain_ok = log.verify_chain();
+
+    println!("Audited-path integration check (compact_witnessed)");
+    println!(
+        "  Store size after compaction : {} (expected {TARGET_SIZE_H1}) : {}",
+        store.len(),
+        if survived { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  Eviction witnesses emitted  : {} (expected {}) : {}",
+        records.len(),
+        N_MEMORIES - TARGET_SIZE_H1,
+        if evicted_count_ok { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  Eviction witness chain verifies : {}",
+        if chain_ok { "PASS" } else { "FAIL" }
+    );
+    println!();
+
+    survived && evicted_count_ok && chain_ok
+}
+
 fn main() {
     let seed: u64 = 2026_0906;
 
@@ -234,6 +299,8 @@ fn main() {
         StructuralTimeWeights::default().metric,
     );
 
+    let (lru_rate, lru_dur, _) = run_experiment1(&LruPolicy, seed);
+    let (lfu_rate, lfu_dur, _) = run_experiment1(&LfuPolicy, seed);
     let (base_rate, base_dur, _) = run_experiment1(&baseline_policy, seed);
     let (dedup_rate, dedup_dur, _) = run_experiment1(&dedup_policy, seed);
     let (struct_rate, struct_dur, _) = run_experiment1(&structural_policy, seed);
@@ -247,7 +314,19 @@ fn main() {
     );
     println!("{}", "-".repeat(64));
     println!(
-        "{:<28} {:>17.1}% {:>16}",
+        "{:<28} {:>17.1}% {:>16} (existing RuVector policy)",
+        LruPolicy.name(),
+        lru_rate * 100.0,
+        lru_dur.as_micros()
+    );
+    println!(
+        "{:<28} {:>17.1}% {:>16} (existing RuVector policy)",
+        LfuPolicy.name(),
+        lfu_rate * 100.0,
+        lfu_dur.as_micros()
+    );
+    println!(
+        "{:<28} {:>17.1}% {:>16} (existing RuVector policy, primary baseline)",
         baseline_policy.name(),
         base_rate * 100.0,
         base_dur.as_micros()
@@ -275,6 +354,8 @@ fn main() {
     let b1_gap_vs_baseline_pp = (struct_rate - base_rate) * 100.0;
     let gap_vs_baseline_pp = (kf_rate - base_rate) * 100.0;
     let gap_vs_dedup_pp = (kf_rate - dedup_rate) * 100.0;
+    let gap_vs_lru_pp = (kf_rate - lru_rate) * 100.0;
+    let gap_vs_lfu_pp = (kf_rate - lfu_rate) * 100.0;
     let h1_pass = gap_vs_baseline_pp >= SURVIVAL_GAP_THRESHOLD_PP;
     let beats_fair_baseline = gap_vs_dedup_pp > 0.0;
 
@@ -285,6 +366,12 @@ fn main() {
     println!(
         "  B2 StructuralKeyframeRetention vs baseline (tick recency) : {gap_vs_baseline_pp:+.1}pp  (need >= +{SURVIVAL_GAP_THRESHOLD_PP:.0}pp) : {}",
         if h1_pass { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  B2 StructuralKeyframeRetention vs LruPolicy (existing RuVector policy) : {gap_vs_lru_pp:+.1}pp"
+    );
+    println!(
+        "  B2 StructuralKeyframeRetention vs LfuPolicy (existing RuVector policy) : {gap_vs_lfu_pp:+.1}pp"
     );
     println!(
         "  B2 StructuralKeyframeRetention vs DedupGated (fair cheap competitor) : {gap_vs_dedup_pp:+.1}pp : {}",
@@ -325,6 +412,8 @@ fn main() {
         StructuralTimeWeights::default().metric,
     );
 
+    let (lru_recall, lru_dur2) = run_experiment2(&LruPolicy, seed);
+    let (lfu_recall, lfu_dur2) = run_experiment2(&LfuPolicy, seed);
     let (base_recall, base_dur2) = run_experiment2(&baseline_prod, seed);
     let (dedup_recall, dedup_dur2) = run_experiment2(&dedup_prod, seed);
     let (kf_recall, kf_dur2) = run_experiment2(&keyframe_prod, seed);
@@ -335,7 +424,19 @@ fn main() {
     );
     println!("{}", "-".repeat(59));
     println!(
-        "{:<28} {:>11.1}% {:>16}",
+        "{:<28} {:>11.1}% {:>16} (existing RuVector policy)",
+        LruPolicy.name(),
+        lru_recall * 100.0,
+        lru_dur2.as_micros()
+    );
+    println!(
+        "{:<28} {:>11.1}% {:>16} (existing RuVector policy)",
+        LfuPolicy.name(),
+        lfu_recall * 100.0,
+        lfu_dur2.as_micros()
+    );
+    println!(
+        "{:<28} {:>11.1}% {:>16} (existing RuVector policy, primary baseline)",
         baseline_prod.name(),
         base_recall * 100.0,
         base_dur2.as_micros()
@@ -376,9 +477,17 @@ fn main() {
     );
     println!();
 
+    // ── Audited-path integration check ──────────────────────────────────────
+    let witnessed_integration_ok = verify_witnessed_integration(seed);
+
     // ── Overall acceptance ───────────────────────────────────────────────────
-    let overall_pass =
-        h1_pass && h2_struct_pass && h2_dedup_pass && perf_pass_e1 && perf_pass_e2 && deterministic;
+    let overall_pass = h1_pass
+        && h2_struct_pass
+        && h2_dedup_pass
+        && perf_pass_e1
+        && perf_pass_e2
+        && deterministic
+        && witnessed_integration_ok;
 
     println!("================================================================");
     println!(

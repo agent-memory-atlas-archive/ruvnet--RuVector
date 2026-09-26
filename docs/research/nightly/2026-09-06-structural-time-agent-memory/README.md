@@ -184,18 +184,27 @@ structural_time_recency_bench --features structural-time`
 
 ### Experiment 1 — recency-only ablation, 360 → 40
 
+`LruPolicy` and `LfuPolicy` are `ruvector-agent-memory`'s original two
+classical policies (predating `CoherencePolicy`); `DedupGatedRecency` is the
+one new baseline this nightly introduces. Every other row is a pre-existing
+RuVector implementation.
+
 | Policy | Survival rate | Compaction (µs) |
 |---|---|---|
-| CoherenceWeighted (baseline) | 10.0% | 13 |
-| DedupGatedRecency (fair baseline) | 12.5% | 30 |
-| StructuralTimeRecency (B1, score-based) | 10.0% | 76 |
-| **StructuralKeyframeRetention (B2)** | **35.0%** | 44 |
+| LruPolicy (existing) | 10.0% | 18 |
+| LfuPolicy (existing) | 12.5% | 14 |
+| CoherenceWeighted (existing, primary baseline) | 10.0% | 16 |
+| DedupGatedRecency (new, fair baseline) | 12.5% | 56 |
+| StructuralTimeRecency (B1, score-based) | 10.0% | 198 |
+| **StructuralKeyframeRetention (B2)** | **35.0%** | 74 |
 
 | Gate | Threshold | Measured | Result |
 |---|---|---|---|
-| B2 vs. baseline | ≥ +15pp | **+25.0pp** | PASS |
-| B2 vs. fair (dedup) baseline | (reported) | +22.5pp | edge confirmed |
-| B2 compaction slowdown vs. baseline | ≤ 20x | 3.25–3.31x | PASS |
+| B2 vs. CoherencePolicy baseline | ≥ +15pp | **+25.0pp** | PASS |
+| B2 vs. LruPolicy (existing) | (reported) | +25.0pp | edge confirmed |
+| B2 vs. LfuPolicy (existing) | (reported) | +22.5pp | edge confirmed |
+| B2 vs. fair (dedup) baseline (new) | (reported) | +22.5pp | edge confirmed |
+| B2 compaction slowdown vs. baseline | ≤ 20x | 2.4–4.7x | PASS |
 | B2 determinism (3 process runs) | identical | identical | PASS |
 | B1 vs. baseline | (informational) | +0.0pp | negative result |
 
@@ -203,15 +212,36 @@ structural_time_recency_bench --features structural-time`
 
 | Policy | Recall@10 | Compaction (µs) |
 |---|---|---|
-| CoherenceWeighted (baseline) | 100.0% | 94–96 |
-| DedupGatedRecency | 100.0% | 85–96 |
-| StructuralKeyframeRetention (B2) | 99.5% | 203–271 |
+| LruPolicy (existing) | 97.5% | 43 |
+| LfuPolicy (existing) | 2.5%\* | 13 |
+| CoherenceWeighted (existing, primary baseline) | 100.0% | 94–181 |
+| DedupGatedRecency (new) | 100.0% | 85–186 |
+| StructuralKeyframeRetention (B2) | 99.5% | 203–439 |
+
+\* LfuPolicy ranks purely by `access_count`, which is 0 for every entry in
+this dataset (no simulated touches) — its 2.5% is degenerate tie-break
+behavior on a policy this benchmark was not designed to exercise favorably,
+not a claim that LFU is a weak retrieval policy in general.
 
 | Gate | Threshold | Measured | Result |
 |---|---|---|---|
 | B2 Recall@10 delta vs. baseline | ≥ −3pp | −0.5pp | PASS |
 | DedupGated Recall@10 delta vs. baseline | ≥ −3pp | +0.0pp | PASS |
-| B2 compaction slowdown vs. baseline | ≤ 20x | 2.73–2.86x | PASS |
+| B2 compaction slowdown vs. baseline | ≤ 20x | 2.4–2.9x | PASS |
+
+### Audited-path integration check
+
+`StructuralKeyframeRetention` was also run through
+`witnessed_compaction::compact_witnessed` — the crate's audited, "no
+witness, no mutation" compaction entry point (ADR-345) — instead of the bare
+`compact()` helper used elsewhere in this benchmark: 320/320 evictions
+emitted a valid chained witness record and the eviction-witness chain
+verified. Every `CompactionPolicy` in this crate, old and new, is generic
+over that same path; there is no separate hand-wired "production" pipeline
+to special-case. `ruvector-agent-memory` itself currently has no consumer
+crate elsewhere in the workspace (no other crate depends on it) — this is
+the full extent of "integration" available inside the crate's own boundary
+until a downstream consumer exists (see ADR-346, Open Questions).
 
 **Acceptance: ACCEPT** (all mandatory gates pass).
 
