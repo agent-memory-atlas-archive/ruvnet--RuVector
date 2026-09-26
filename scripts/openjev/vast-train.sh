@@ -12,7 +12,7 @@
 # cuda:12.4.1-devel-ubuntu22.04 (glibc 2.35) fails to link (__isoc23_strtol).
 # CUDA 12.6 needs host driver >= 560.
 #   IMG=nvidia/cuda:12.6.3-devel-ubuntu24.04@sha256:392c0df7b577ecae17a17f6ba7f2009c217bb4422f8431c053ae9af61a8c148a
-#   ruvector-gpu-runner launch --dry-run --max-usd 5 --max-hours 3 --image "$IMG" \
+#   ruvector-gpu-runner launch --dry-run --max-usd 5 --max-hours 3 --image "$IMG" --min-cuda 12.6 \
 #     --git-ref feat/openjev-train --git-sha "$(git rev-parse HEAD)" \
 #     --cmd 'bash scripts/openjev/vast-train.sh --seed 1'
 #
@@ -93,7 +93,10 @@ if [ -z "${OPENJEV_BIN:-}" ]; then
   fi
   FEATURES=(); [ "$DEVICE" = cpu ] || FEATURES=(--features cuda)
   log "cargo build (compute cap ${CUDA_COMPUTE_CAP:-n/a}) ${FEATURES[*]}"
-  cargo build --release --locked -p ruvector-typesafe-train "${FEATURES[@]}" 2>&1 | tee "$ART/logs/build.log" | tail -3
+  # One retry: rustc has been seen to SIGSEGV transiently on long release
+  # builds; cargo resumes from the finished units.
+  build() { cargo build --release --locked -p ruvector-typesafe-train "${FEATURES[@]}" 2>&1 | tee -a "$ART/logs/build.log" | tail -3; }
+  build || { log "build failed; retrying once"; build; }
   BIN="$REPO/target/release/openjev"
   stamp build
 else
