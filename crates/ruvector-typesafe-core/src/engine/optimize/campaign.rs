@@ -87,7 +87,7 @@ impl<E: Embedder> crate::engine::Engine<E> {
             budget: Budget::new(spec.budget_per_day, spec.day_key.clone()),
             accuracy_tolerance: spec.accuracy_tolerance,
         };
-        let mut log = ReceiptLog::new();
+        let mut log = ReceiptLog::with_hash_alg(spec.receipt_hash);
         let mut arms = Vec::new();
         let mut promotions = 0usize;
 

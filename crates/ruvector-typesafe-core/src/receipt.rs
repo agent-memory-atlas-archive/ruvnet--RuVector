@@ -12,6 +12,16 @@
 //! monotonic `created_seq`. Ed25519 signing is a v2 concern — [`Receipt`] keeps
 //! a `signature: Option<String>` slot that is excluded from the content hash so
 //! a later signature never invalidates the chain.
+//!
+//! Two chain hashes are supported. The default, [`HashAlg::Fnv1a128`], is a
+//! fast non-cryptographic checksum: it catches accidental edits and corruption,
+//! but someone who can edit the log can also craft a matching hash. A log built
+//! with [`ReceiptLog::with_hash_alg`]`(`[`HashAlg::Sha256`]`)` chains SHA-256
+//! digests instead (stored as `"sha256:<hex>"`), so anchoring the last hash
+//! somewhere the editor cannot reach (a signed release, a ticket, a git commit)
+//! makes every earlier receipt tamper-evident. Verification reads the algorithm
+//! from each stored hash, so old FNV logs verify unchanged, and
+//! [`ReceiptLog::verify_chain_requiring`] rejects a downgrade.
 
 use crate::loop_gate::{GateDecision, PromotionCriterion, Proposal, ProposalKind};
 use crate::{Head, Result, TypesafeError};
@@ -19,6 +29,32 @@ use serde::{Deserialize, Serialize};
 
 /// Genesis link for the first receipt in a log (32 hex zeros = 128-bit width).
 pub const GENESIS_HASH: &str = "00000000000000000000000000000000";
+
+/// Prefix marking a SHA-256 chain hash (`"sha256:" + 64 hex`).
+pub const SHA256_PREFIX: &str = "sha256:";
+
+/// Which digest a [`ReceiptLog`] chains with. See the module docs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HashAlg {
+    /// 128-bit FNV-1a ([`content_hash`]): integrity against accidents only.
+    #[default]
+    Fnv1a128,
+    /// SHA-256: tamper-evident once the chain head is anchored externally.
+    Sha256,
+}
+
+impl HashAlg {
+    /// The algorithm a stored hash was produced with.
+    #[must_use]
+    pub fn of(hash: &str) -> Self {
+        if hash.starts_with(SHA256_PREFIX) {
+            HashAlg::Sha256
+        } else {
+            HashAlg::Fnv1a128
+        }
+    }
+}
 
 /// A pair of accuracies on one split. Self-describing: both the baseline and
 /// the champion number travel together so a receipt cannot misreport either.
@@ -122,14 +158,17 @@ pub struct Receipt {
 impl Receipt {
     /// Content hash over every field except `hash` and `signature`. `prev_hash`
     /// is included, which is what chains the log together.
-    fn digest(&self) -> String {
+    fn digest(&self, alg: HashAlg) -> String {
         let mut v = serde_json::to_value(self).expect("receipt is serialisable");
         if let Some(obj) = v.as_object_mut() {
             obj.remove("hash");
             obj.remove("signature");
         }
         let bytes = serde_json::to_string(&v).expect("value is serialisable");
-        content_hash(bytes.as_bytes())
+        match alg {
+            HashAlg::Fnv1a128 => content_hash(bytes.as_bytes()),
+            HashAlg::Sha256 => sha256_hash(bytes.as_bytes()),
+        }
     }
 }
 
@@ -137,12 +176,31 @@ impl Receipt {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReceiptLog {
     receipts: Vec<Receipt>,
+    /// Digest used for receipts pushed to this log (not serialised: each stored
+    /// hash names its own algorithm).
+    #[serde(skip)]
+    hash_alg: HashAlg,
 }
 
 impl ReceiptLog {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An empty log whose pushed receipts are chained with `alg`.
+    #[must_use]
+    pub fn with_hash_alg(alg: HashAlg) -> Self {
+        Self {
+            receipts: Vec::new(),
+            hash_alg: alg,
+        }
+    }
+
+    /// The digest used for receipts pushed from now on.
+    #[must_use]
+    pub fn hash_alg(&self) -> HashAlg {
+        self.hash_alg
     }
 
     /// Append `receipt`, assigning its `seq`, `prev_hash` and `hash`. Returns
@@ -154,7 +212,7 @@ impl ReceiptLog {
             .last()
             .map_or_else(|| GENESIS_HASH.to_string(), |r| r.hash.clone());
         receipt.hash = String::new();
-        receipt.hash = receipt.digest();
+        receipt.hash = receipt.digest(self.hash_alg);
         self.receipts.push(receipt);
         self.receipts.last().expect("just pushed")
     }
@@ -195,7 +253,11 @@ impl ReceiptLog {
                 .map_err(|e| TypesafeError::Invalid(format!("receipt parse: {e}")))?;
             receipts.push(r);
         }
-        Ok(Self { receipts })
+        // Keep chaining with the algorithm the log already uses.
+        let hash_alg = receipts
+            .last()
+            .map_or(HashAlg::Fnv1a128, |r| HashAlg::of(&r.hash));
+        Ok(Self { receipts, hash_alg })
     }
 
     /// Recompute the chain. `Err(i)` names the first receipt whose stored hash,
@@ -207,12 +269,26 @@ impl ReceiptLog {
             if r.seq != i as u64 || r.prev_hash != expected_prev {
                 return Err(i);
             }
-            if r.digest() != r.hash {
+            if r.digest(HashAlg::of(&r.hash)) != r.hash {
                 return Err(i);
             }
             expected_prev = r.hash.clone();
         }
         Ok(())
+    }
+
+    /// [`verify_chain`](Self::verify_chain), and additionally `Err(i)` for the
+    /// first receipt not hashed with `alg` — so a SHA-256 log cannot be
+    /// silently rewritten with the weaker default.
+    pub fn verify_chain_requiring(&self, alg: HashAlg) -> std::result::Result<(), usize> {
+        if let Some(i) = self
+            .receipts
+            .iter()
+            .position(|r| HashAlg::of(&r.hash) != alg)
+        {
+            return Err(i);
+        }
+        self.verify_chain()
     }
 }
 
@@ -227,6 +303,19 @@ pub fn content_hash(bytes: &[u8]) -> String {
     h2 ^= (bytes.len() as u64).wrapping_mul(0x100_0000_01b3);
     h2 = fnv1a(&h2.to_le_bytes(), h2);
     format!("{h1:016x}{h2:016x}")
+}
+
+/// SHA-256 chain hash, `"sha256:" + 64 lowercase hex`.
+#[must_use]
+pub fn sha256_hash(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let d = Sha256::digest(bytes);
+    let mut out = String::with_capacity(SHA256_PREFIX.len() + 64);
+    out.push_str(SHA256_PREFIX);
+    for b in d {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
 }
 
 fn fnv1a(bytes: &[u8], offset: u64) -> u64 {
@@ -337,6 +426,7 @@ mod tests {
         jsonl_receipt.signature = Some("ed25519:deadbeef".into());
         let mut relog = ReceiptLog {
             receipts: vec![jsonl_receipt],
+            hash_alg: HashAlg::default(),
         };
         // prev_hash for index 0 is genesis, seq 0 — still valid, hash unchanged.
         relog.receipts[0].prev_hash = GENESIS_HASH.to_string();
@@ -349,5 +439,58 @@ mod tests {
     fn metrics_ratio_guards_zero_n() {
         assert_eq!(Metrics::ratio(0, 0), 0.0);
         assert_eq!(Metrics::ratio(3, 4), 0.75);
+    }
+
+    #[test]
+    fn sha256_log_chains_verifies_and_detects_tampering() {
+        let mut log = ReceiptLog::with_hash_alg(HashAlg::Sha256);
+        log.push(sample_receipt(0.90));
+        log.push(sample_receipt(0.91));
+        for r in log.iter() {
+            assert!(r.hash.starts_with(SHA256_PREFIX));
+            assert_eq!(r.hash.len(), SHA256_PREFIX.len() + 64);
+        }
+        assert!(log.verify_chain_requiring(HashAlg::Sha256).is_ok());
+        let jsonl = log.to_jsonl();
+        let reloaded = ReceiptLog::from_jsonl(&jsonl).unwrap();
+        assert!(reloaded.verify_chain().is_ok());
+        assert_eq!(reloaded.hash_alg(), HashAlg::Sha256);
+        let tampered = ReceiptLog::from_jsonl(&jsonl.replacen("0.91", "0.99", 1)).unwrap();
+        assert_eq!(tampered.verify_chain(), Err(1));
+    }
+
+    #[test]
+    fn default_log_is_unchanged_and_downgrade_is_rejected() {
+        // Default stays FNV-1a, byte-identical to before.
+        let mut fnv = ReceiptLog::new();
+        fnv.push(sample_receipt(0.90));
+        let r = fnv.iter().next().unwrap();
+        assert_eq!(r.hash.len(), 32);
+        let mut body = serde_json::to_value(r).unwrap();
+        body.as_object_mut().unwrap().remove("hash");
+        assert_eq!(
+            r.hash,
+            content_hash(serde_json::to_string(&body).unwrap().as_bytes())
+        );
+        assert!(fnv.verify_chain().is_ok());
+        // A SHA-256 policy rejects an FNV chain (e.g. a rewritten log).
+        assert_eq!(fnv.verify_chain_requiring(HashAlg::Sha256), Err(0));
+    }
+
+    #[test]
+    fn sha256_hash_matches_a_known_vector() {
+        assert_eq!(
+            sha256_hash(b"abc"),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        // Wire names used by the campaign spec's `receipt_hash`.
+        assert_eq!(
+            serde_json::to_string(&HashAlg::Sha256).unwrap(),
+            "\"sha256\""
+        );
+        assert_eq!(
+            serde_json::to_string(&HashAlg::Fnv1a128).unwrap(),
+            "\"fnv1a128\""
+        );
     }
 }

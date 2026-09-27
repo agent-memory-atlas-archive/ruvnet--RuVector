@@ -60,6 +60,13 @@ export interface CampaignSpec {
   day_key?: string;
   created_seq_base?: number;
   created?: string | null;
+  /**
+   * Receipt chain hash: `'fnv1a128'` (default; catches accidental edits) or
+   * `'sha256'` (tamper-evident once the last hash is anchored somewhere the
+   * log's editor cannot change). Hashes record their algorithm, so old logs
+   * still verify.
+   */
+  receipt_hash?: 'fnv1a128' | 'sha256';
 }
 
 /** A pair of accuracies on one split (mirrors `receipt::Metrics`). */

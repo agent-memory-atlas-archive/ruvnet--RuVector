@@ -20,5 +20,7 @@ ruvector-router-core = { version = "2.0", path = "../ruvector-router-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# SHA-256 receipt chains (opt-in `HashAlg::Sha256`); pure Rust, wasm-safe.
+sha2 = "0.10"
 
 [dev-dependencies]
