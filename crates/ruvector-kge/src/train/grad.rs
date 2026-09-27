@@ -11,6 +11,19 @@ pub trait Differentiable: Scorer {
     /// Gradient of `score(s, r, o)` w.r.t. each input vector, returned as
     /// `(d_score/d_s, d_score/d_r, d_score/d_o)`. No side effects.
     fn grad(&self, s: &[f32], r: &[f32], o: &[f32]) -> (Vec<f32>, Vec<f32>, Vec<f32>);
+
+    /// True when the score is linear in each entity argument separately
+    /// (`score(Σ a_e·e, r, o) = Σ a_e·score(e, r, o)`, and likewise for `o`)
+    /// **and** `query_vector · index_vector` reproduces `score` exactly.
+    ///
+    /// HolE / ComplEx / DistMult satisfy this; RotatE (a distance) does not.
+    /// It lets the 1-vs-all loss score every entity with one dot product per
+    /// entity and collapse the per-entity gradient sums into a single `grad`
+    /// call (see `loss::one_vs_all_step_batched`). Defaults to `false`, which
+    /// keeps the exact per-entity path.
+    fn multilinear(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -67,6 +80,9 @@ pub(crate) mod testing {
             let dr: Vec<f32> = s.iter().zip(o).map(|(&a, &c)| a * c).collect();
             let do_: Vec<f32> = s.iter().zip(r).map(|(&a, &b)| a * b).collect();
             (ds, dr, do_)
+        }
+        fn multilinear(&self) -> bool {
+            true
         }
     }
 
