@@ -231,17 +231,37 @@ pub(crate) fn one_vs_all_step(
 }
 
 /// Per-batch precomputation for [`one_vs_all_step_batched`]: every entity's
-/// index vector (row-major, `num_entities × index_dims`) plus a dense
-/// accumulator for the per-entity gradients of the batch.
+/// index vector (row-major, `num_entities × index_dims`) plus, per scored
+/// side, the softmax coefficients and the open-slot gradient, which
+/// [`flush`](Self::flush) turns into per-entity gradients.
 ///
 /// Built once per mini-batch — the tables do not change inside a batch
 /// (the optimiser applies after it), so the index vectors stay valid.
 pub(crate) struct BatchedOneVsAll {
     index: Vec<f32>,
     index_dims: usize,
-    dense: Vec<f32>,
     dims: usize,
-    logits: Vec<f32>,
+    num_entities: usize,
+    /// `(coefficients over all entities, open-slot gradient)` per scored
+    /// side, in the order the sides were scored.
+    pending: Vec<(Vec<f32>, Vec<f32>)>,
+}
+
+/// One scored side of one positive: everything the step contributes to the
+/// batch gradient, computed without touching shared state.
+pub(crate) struct SideOut {
+    anchor_id: u32,
+    rel_id: u32,
+    g_anchor: Vec<f32>,
+    g_rel: Vec<f32>,
+    coeffs: Vec<f32>,
+    unit: Vec<f32>,
+}
+
+/// The loss and both sides of one positive (see [`batched_positive`]).
+pub(crate) struct PositiveOut {
+    pub(crate) loss: f32,
+    sides: [SideOut; 2],
 }
 
 impl BatchedOneVsAll {
@@ -255,58 +275,64 @@ impl BatchedOneVsAll {
         Ok(Self {
             index,
             index_dims: dd,
-            dense: vec![0.0; n * scorer.dims()],
             dims: scorer.dims(),
-            logits: vec![0.0; n],
+            num_entities: n,
+            pending: Vec::new(),
         })
     }
 
-    fn score_all(&mut self, q: &[f32]) {
-        for (e, lg) in self.logits.iter_mut().enumerate() {
-            let row = &self.index[e * self.index_dims..(e + 1) * self.index_dims];
-            *lg = row.iter().zip(q).map(|(a, b)| a * b).sum();
+    /// Add one positive's anchor and relation gradients to `grads` (same
+    /// order as the sequential path) and queue its open-slot terms.
+    pub(crate) fn absorb(&mut self, out: PositiveOut, grads: &mut Grads) {
+        for side in out.sides {
+            grads.add_entity(side.anchor_id, &side.g_anchor);
+            grads.add_relation(side.rel_id, &side.g_rel);
+            self.pending.push((side.coeffs, side.unit));
         }
     }
 
-    /// Move the accumulated per-entity gradients into `grads`.
+    /// Move the accumulated per-entity gradients into `grads`:
+    /// `dense[e] = Σ_k coeffs_k[e] · unit_k`, summed in scoring order, so the
+    /// result is identical whether the rows are built on one thread or many.
     pub(crate) fn flush(&mut self, grads: &mut Grads) {
         let d = self.dims;
-        for (e, row) in self.dense.chunks(d).enumerate() {
-            if row.iter().any(|&x| x != 0.0) {
-                grads.add_entity(e as u32, row);
+        let pending = std::mem::take(&mut self.pending);
+        let row = |e: usize| -> Vec<f32> {
+            let mut acc = vec![0.0f32; d];
+            for (coeffs, unit) in &pending {
+                let c = coeffs[e];
+                if c != 0.0 {
+                    axpy(&mut acc, c, unit);
+                }
+            }
+            acc
+        };
+        let rows: Vec<Vec<f32>> = super::par::map_range(self.num_entities, row);
+        for (e, acc) in rows.iter().enumerate() {
+            if acc.iter().any(|&x| x != 0.0) {
+                grads.add_entity(e as u32, acc);
             }
         }
-        self.dense.iter_mut().for_each(|x| *x = 0.0);
     }
 }
 
-/// Batched 1-vs-all cross-entropy for multilinear scorers
-/// ([`Differentiable::multilinear`]). Same loss and gradients as
-/// [`one_vs_all_step`], computed without a per-entity `score`/`grad` call:
-///
-/// - every entity is scored with one dot product against the precomputed
-///   index vectors (`query · index = score` exactly);
-/// - because the score is linear in the open slot, `Σ_e c_e ∇_{s,r} score(s,r,e)`
-///   equals `∇_{s,r} score(s, r, Σ_e c_e e)`, so the anchor/relation gradients
-///   need one `grad` call on the coefficient-weighted entity;
-/// - the open-slot gradient does not depend on the open entity, so entity `e`
-///   receives `c_e · g` for a single vector `g`.
-///
-/// Cost per positive: `O(|E|·d)` multiply-adds plus two `grad` calls, instead
-/// of `4·|E|` FFT-based score/grad calls.
-pub(crate) fn one_vs_all_step_batched(
+/// Score one positive on both sides with the batched 1-vs-all formulation
+/// (see [`one_vs_all_step_batched`]). Pure: reads the tables and the batch's
+/// index vectors, writes nothing, so positives can be scored in parallel.
+pub(crate) fn batched_positive(
     tables: &Tables,
     scorer: &dyn Differentiable,
+    batch: &BatchedOneVsAll,
     t: Triple,
-    batch: &mut BatchedOneVsAll,
-    grads: &mut Grads,
-) -> Result<f32> {
+) -> Result<PositiveOut> {
     let n = tables.num_entities();
     let d = scorer.dims();
+    let dd = batch.index_dims;
     let s = tables.entity(t.s)?;
     let r = tables.relation(t.r)?;
     let o = tables.entity(t.o)?;
     let mut loss = 0.0f32;
+    let mut sides = Vec::with_capacity(2);
 
     for side in [crate::Side::Tail, crate::Side::Head] {
         let (anchor, anchor_id, gold) = match side {
@@ -314,13 +340,22 @@ pub(crate) fn one_vs_all_step_batched(
             crate::Side::Head => (o, t.o, t.s),
         };
         let q = scorer.query_vector(r, anchor, side);
-        batch.score_all(&q);
-        softmax_inplace(&mut batch.logits);
-        loss += -(batch.logits[gold as usize].max(1e-30)).ln();
-        // Coefficient-weighted open entity: Σ_e (p_e − 1{e = gold}) · E_e.
+        let mut logits: Vec<f32> = (0..n)
+            .map(|e| {
+                batch.index[e * dd..(e + 1) * dd]
+                    .iter()
+                    .zip(&q)
+                    .map(|(a, b)| a * b)
+                    .sum()
+            })
+            .collect();
+        softmax_inplace(&mut logits);
+        loss += -(logits[gold as usize].max(1e-30)).ln();
+        // Coefficients (p_e − 1{e = gold}); the weighted open entity is Σ_e c_e · E_e.
+        logits[gold as usize] -= 1.0;
+        let coeffs = logits;
         let mut weighted = vec![0.0f32; d];
-        for e in 0..n {
-            let c = batch.logits[e] - if e as u32 == gold { 1.0 } else { 0.0 };
+        for (e, &c) in coeffs.iter().enumerate() {
             if c != 0.0 {
                 axpy(&mut weighted, c, tables.entity(e as u32)?);
             }
@@ -335,16 +370,53 @@ pub(crate) fn one_vs_all_step_batched(
                 (gs, gr, go)
             }
         };
-        grads.add_entity(anchor_id, &g_anchor);
-        grads.add_relation(t.r, &g_rel);
         // `unit` is ∂score/∂(open slot); it is the same for every open entity.
-        for e in 0..n {
-            let c = batch.logits[e] - if e as u32 == gold { 1.0 } else { 0.0 };
-            if c != 0.0 {
-                axpy(&mut batch.dense[e * d..(e + 1) * d], c, &unit);
-            }
-        }
+        sides.push(SideOut {
+            anchor_id,
+            rel_id: t.r,
+            g_anchor,
+            g_rel,
+            coeffs,
+            unit,
+        });
     }
+    let [tail, head]: [SideOut; 2] = sides.try_into().map_err(|_| {
+        crate::KgeError::Invalid("batched 1-vs-all produced the wrong number of sides".into())
+    })?;
+    Ok(PositiveOut {
+        loss,
+        sides: [tail, head],
+    })
+}
+
+/// Batched 1-vs-all cross-entropy for multilinear scorers
+/// ([`Differentiable::multilinear`]). Same loss and gradients as
+/// [`one_vs_all_step`], computed without a per-entity `score`/`grad` call:
+///
+/// - every entity is scored with one dot product against the precomputed
+///   index vectors (`query · index = score` exactly);
+/// - because the score is linear in the open slot, `Σ_e c_e ∇_{s,r} score(s,r,e)`
+///   equals `∇_{s,r} score(s, r, Σ_e c_e e)`, so the anchor/relation gradients
+///   need one `grad` call on the coefficient-weighted entity;
+/// - the open-slot gradient does not depend on the open entity, so entity `e`
+///   receives `c_e · g` for a single vector `g` (applied in [`BatchedOneVsAll::flush`]).
+///
+/// Cost per positive: `O(|E|·d)` multiply-adds plus two `grad` calls, instead
+/// of `4·|E|` FFT-based score/grad calls. The trainer calls
+/// [`batched_positive`] and [`BatchedOneVsAll::absorb`] directly so the
+/// scoring can run in parallel; this sequential form is the reference the
+/// tests compare against.
+#[cfg(test)]
+pub(crate) fn one_vs_all_step_batched(
+    tables: &Tables,
+    scorer: &dyn Differentiable,
+    t: Triple,
+    batch: &mut BatchedOneVsAll,
+    grads: &mut Grads,
+) -> Result<f32> {
+    let out = batched_positive(tables, scorer, batch, t)?;
+    let loss = out.loss;
+    batch.absorb(out, grads);
     Ok(loss)
 }
 
@@ -448,5 +520,42 @@ mod batched_tests {
     #[test]
     fn batched_matches_exact_for_distmult() {
         check(&DistMult::new(8), 8);
+    }
+
+    /// Scoring positives out of order (as the parallel path may) and folding
+    /// them in batch order gives bit-identical gradients to the sequential step.
+    #[test]
+    fn scoring_order_does_not_change_the_gradients() {
+        let dims = 16;
+        let scorer = HolE::new(dims).unwrap();
+        let tables = Tables::new(29, 3, dims, 5);
+        let triples: Vec<Triple> = (0..9u32)
+            .map(|i| Triple::new(i * 3 % 29, i % 3, (i * 7 + 1) % 29))
+            .collect();
+
+        let mut seq = Grads::new(dims);
+        let mut b1 = BatchedOneVsAll::new(&tables, &scorer).unwrap();
+        let mut l_seq = 0.0f32;
+        for &t in &triples {
+            l_seq += one_vs_all_step_batched(&tables, &scorer, t, &mut b1, &mut seq).unwrap();
+        }
+        b1.flush(&mut seq);
+
+        let mut b2 = BatchedOneVsAll::new(&tables, &scorer).unwrap();
+        let mut outs: Vec<Option<PositiveOut>> = (0..triples.len()).map(|_| None).collect();
+        for k in (0..triples.len()).rev() {
+            outs[k] = Some(batched_positive(&tables, &scorer, &b2, triples[k]).unwrap());
+        }
+        let mut par = Grads::new(dims);
+        let mut l_par = 0.0f32;
+        for out in outs.into_iter().flatten() {
+            l_par += out.loss;
+            b2.absorb(out, &mut par);
+        }
+        b2.flush(&mut par);
+
+        assert_eq!(l_seq.to_bits(), l_par.to_bits());
+        assert_eq!(seq.entity_rows(), par.entity_rows());
+        assert_eq!(seq.relation_rows(), par.relation_rows());
     }
 }
