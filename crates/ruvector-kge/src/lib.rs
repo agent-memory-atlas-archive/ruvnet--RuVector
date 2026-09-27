@@ -34,5 +34,8 @@ pub use optimize::{
 };
 pub use scorer::{HolE, RotatE, Scorer};
 pub use tables::Tables;
-pub use train::{Differentiable, LossKind, OptimKind, Progress, TrainConfig, Trainer};
+pub use train::{
+    Differentiable, DuplicateWeighting, LossKind, OptimKind, Progress, TrainConfig, Trainer,
+    MAX_FACT_REPEATS,
+};
 pub use types::*;
