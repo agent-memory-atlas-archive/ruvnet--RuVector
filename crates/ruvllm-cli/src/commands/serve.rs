@@ -50,6 +50,7 @@ pub async fn run(
     max_context: usize,
     quantization: &str,
     cache_dir: &str,
+    strict: bool,
 ) -> Result<()> {
     let quant = QuantPreset::from_str(quantization)
         .ok_or_else(|| anyhow::anyhow!("Invalid quantization format: {}", quantization))?;
@@ -100,11 +101,25 @@ pub async fn run(
             }
         }
         Err(e) => {
+            if strict {
+                anyhow::bail!(
+                    "model {} failed to load: {}. Refusing to serve placeholder \"mock mode\" \
+                     responses because --strict (RUVLLM_STRICT) is set.",
+                    model_id,
+                    e
+                );
+            }
             // Create a mock server for development/testing
             println!(
                 "{} Model loading failed: {}. Running in mock mode.",
                 style("Warning:").yellow().bold(),
                 e
+            );
+            println!(
+                "{} Every completion will be placeholder text, not model output. Responses \
+                 carry `x-ruvllm-mode: mock` and /health reports \"mode\": \"mock\". Pass \
+                 --strict (or RUVLLM_STRICT=1) to exit instead.",
+                style("Warning:").yellow().bold()
             );
         }
     }
@@ -127,6 +142,11 @@ pub async fn run(
         .route("/health", get(health_check))
         .route("/metrics", get(metrics))
         .route("/", get(root))
+        // Label every response with whether a real model produced it.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            label_mode,
+        ))
         // State and middleware
         .with_state(state)
         .layer(
@@ -597,6 +617,37 @@ async fn list_models(State(state): State<SharedState>) -> impl IntoResponse {
     Json(models)
 }
 
+/// `"model"` when a real model is loaded, `"mock"` when completions are
+/// placeholder text.
+fn mode_of(state: &ServerState) -> &'static str {
+    if state
+        .backend
+        .as_ref()
+        .map(|b| b.is_model_loaded())
+        .unwrap_or(false)
+    {
+        "model"
+    } else {
+        "mock"
+    }
+}
+
+/// Middleware: add `x-ruvllm-mode: model|mock` to every response, so a client
+/// can tell placeholder completions from model output without parsing text.
+async fn label_mode(
+    State(state): State<SharedState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mode = mode_of(&*state.read().await);
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static("x-ruvllm-mode"),
+        axum::http::HeaderValue::from_static(mode),
+    );
+    response
+}
+
 /// Health check endpoint
 async fn health_check(State(state): State<SharedState>) -> impl IntoResponse {
     let state_lock = state.read().await;
@@ -614,6 +665,7 @@ async fn health_check(State(state): State<SharedState>) -> impl IntoResponse {
 
     let health = serde_json::json!({
         "status": status,
+        "mode": mode_of(&state_lock),
         "model": state_lock.model_id,
         "uptime_seconds": state_lock.start_time.elapsed().as_secs()
     });
@@ -721,6 +773,45 @@ fn map_quantization(quant: QuantPreset) -> ruvllm::Quantization {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unloaded_state() -> SharedState {
+        Arc::new(RwLock::new(ServerState {
+            model_id: "m".into(),
+            backend: None,
+            request_count: 0,
+            total_tokens: 0,
+            start_time: Instant::now(),
+        }))
+    }
+
+    #[tokio::test]
+    async fn responses_and_health_are_labelled_mock_without_a_model() {
+        use tower::ServiceExt;
+        let state = unloaded_state();
+        let app = Router::new()
+            .route("/health", get(health_check))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                label_mode,
+            ))
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.headers()["x-ruvllm-mode"], "mock");
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["mode"], "mock");
+        assert_eq!(json["status"], "degraded");
+    }
 
     #[test]
     fn test_build_prompt() {

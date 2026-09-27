@@ -119,7 +119,16 @@ ruvllm serve qwen --host 0.0.0.0 --port 8080
 
 # Configure concurrency
 ruvllm serve qwen --max-concurrent 8 --max-context 8192
+
+# Exit if the model fails to load, instead of serving mock responses
+ruvllm serve qwen --strict        # or RUVLLM_STRICT=1
 ```
+
+If the model fails to load, `serve` keeps running in **mock mode**: completions
+are fixed placeholder text, not model output. A warning is printed at startup,
+every response carries an `x-ruvllm-mode: mock` header (`model` when a model is
+loaded), and `/health` reports `"mode": "mock"`. Use `--strict` in production
+and CI so a failed load exits with an error instead.
 
 #### API Endpoints
 
