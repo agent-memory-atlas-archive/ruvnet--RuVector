@@ -91,6 +91,7 @@ export type {
   NoulAnswer,
   QuestionWire,
   ScoreAnswer,
+  TrainOptions,
   TrainReport,
   TypesafeErrorShape,
   Usage,

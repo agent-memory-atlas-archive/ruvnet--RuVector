@@ -131,6 +131,21 @@ test('train forwards the payload and returns the TrainReport', async () => {
   void sent;
 });
 
+test('train forwards an optional question kind', async () => {
+  const { binding, holder } = makeBinding();
+  const ts = createTypesafe({ binding });
+  const sent = [];
+  const orig = holder.engine.trainJson.bind(holder.engine);
+  holder.engine.trainJson = (json) => {
+    sent.push(JSON.parse(json));
+    return orig(json);
+  };
+  await ts.train('dept', [{ text: 't', label: 'yes' }], { kind: 'choice' });
+  await ts.train('dept', [{ text: 't', label: 'yes' }]);
+  assert.equal(sent[0].kind, 'choice', 'kind is sent when given');
+  assert.ok(!('kind' in sent[1]), 'no kind field without the option (wire format unchanged)');
+});
+
 test('version and backend surface the binding metadata', async () => {
   const { binding } = makeBinding();
   const ts = createTypesafe({ binding });

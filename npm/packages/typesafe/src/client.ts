@@ -27,6 +27,7 @@ import {
   LabeledExample,
   QuestionWire,
   ScoreQuestionWire,
+  TrainOptions,
   TrainReport,
   Usage,
 } from './types';
@@ -88,7 +89,17 @@ export interface Typesafe {
     opts?: DecideManyOptions,
   ): Promise<Array<DecisionResult<Q>>>;
   systemOne(body: SystemOneBody, opts?: SystemOneOptions): Promise<DecisionResponse>;
-  train(questionId: string, examples: readonly LabeledExample[]): Promise<TrainReport>;
+  /**
+   * Admit labelled examples for one question. Pass `{ kind }` (`'choice'`,
+   * `'score'` or `'noul'`) so `TrainReport.head` matches the head `decide`
+   * will use; without it the head is inferred from the labels, and
+   * boolean-looking labels (`yes`/`no`) are reported as `logistic`.
+   */
+  train(
+    questionId: string,
+    examples: readonly LabeledExample[],
+    opts?: TrainOptions,
+  ): Promise<TrainReport>;
   /**
    * Run an optimize campaign (ADR-004) over `EngineTuning` for this engine's
    * embedder: a gated grid search that promotes only through the paired
@@ -256,8 +267,11 @@ export function createTypesafe(opts: TypesafeOptions = {}): Typesafe {
   async function train(
     questionId: string,
     examples: readonly LabeledExample[],
+    opts?: TrainOptions,
   ): Promise<TrainReport> {
-    const payload = JSON.stringify({ question: questionId, examples });
+    const payload = JSON.stringify(
+      opts?.kind ? { question: questionId, examples, kind: opts.kind } : { question: questionId, examples },
+    );
     const parsed: unknown = JSON.parse(engine.trainJson(payload));
     if (isErrorShape(parsed)) {
       throw new TypesafeError(parsed.error.message, parsed.error.kind);

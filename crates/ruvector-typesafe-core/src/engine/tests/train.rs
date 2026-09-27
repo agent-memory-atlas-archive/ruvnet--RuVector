@@ -328,3 +328,41 @@ fn empty_calibration_is_bit_identical_to_plain_train() {
     let b = serde_json::to_string(&two.decide(&req).unwrap()).unwrap();
     assert_eq!(a, b);
 }
+
+#[test]
+fn train_typed_reports_the_head_decide_will_use() {
+    let rows: Vec<LabeledExample> = (0..12)
+        .map(|i| LabeledExample {
+            text: format!(
+                "message number {i} about {}",
+                if i % 2 == 0 { "refunds" } else { "logins" }
+            ),
+            label: if i % 2 == 0 {
+                "yes".into()
+            } else {
+                "no".into()
+            },
+        })
+        .collect();
+    // Label inference (no kind): boolean-looking labels read as a noul.
+    let mut a = Engine::new(HashEmbedder::new(DIMS));
+    assert_eq!(a.train("q", &rows).unwrap().head, Head::Logistic);
+    // Declared choice: a class head, never logistic.
+    let mut b = Engine::new(HashEmbedder::new(DIMS));
+    let rep = b
+        .train_typed("q", Some(QuestionKind::Choice), &rows, &[])
+        .unwrap();
+    assert_ne!(
+        rep.head,
+        Head::Logistic,
+        "a choice question is answered by a class head"
+    );
+    // Declared noul: logistic.
+    let mut c = Engine::new(HashEmbedder::new(DIMS));
+    assert_eq!(
+        c.train_typed("q", Some(QuestionKind::Noul), &rows, &[])
+            .unwrap()
+            .head,
+        Head::Logistic
+    );
+}
