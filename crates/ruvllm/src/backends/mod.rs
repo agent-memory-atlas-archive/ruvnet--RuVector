@@ -71,6 +71,9 @@
 mod candle_backend;
 
 #[cfg(feature = "candle")]
+pub mod gguf_tokenizer;
+
+#[cfg(feature = "candle")]
 pub use candle_backend::*;
 
 // Lattice backend (pure-Rust Qwen3.5 Metal inference). macOS-only today: the
