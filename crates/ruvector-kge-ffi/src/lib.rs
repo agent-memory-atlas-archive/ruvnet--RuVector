@@ -70,6 +70,25 @@ impl Model {
         read(&self.inner).to_json()
     }
 
+    /// Rebuild a model from a signed envelope, requiring its HMAC to verify
+    /// under `key`; throws when unsigned, edited, or the key is wrong.
+    #[napi(factory, js_name = "fromJsonVerified")]
+    pub fn from_json_verified(model_json: String, key: String) -> Result<Self> {
+        let m = KgeModel::from_json_verified(&model_json, &key).map_err(Error::from_reason)?;
+        Ok(Self {
+            inner: Arc::new(RwLock::new(m)),
+        })
+    }
+
+    /// Serialize to `{"sha256","hmac_sha256","model"}` signed with `key`
+    /// (at least 16 bytes).
+    #[napi(js_name = "toJsonSigned")]
+    pub fn to_json_signed(&self, key: String) -> Result<String> {
+        read(&self.inner)
+            .to_json_signed(&key)
+            .map_err(Error::from_reason)
+    }
+
     /// Admit `[{"s","r","o"}]`. Returns a summary or error JSON.
     #[napi(js_name = "addTriplesJson")]
     pub fn add_triples_json(&self, triples_json: String) -> String {

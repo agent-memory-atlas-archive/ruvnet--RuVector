@@ -80,8 +80,13 @@ export interface Kge<R extends string = string> {
    * arms over the model's splits, then install the champion's trained tables.
    */
   optimize(spec?: OptimizeSpec): OptimizeReport;
-  /** Serialize to a hash-carrying envelope (pass to {@link loadKge}). */
-  save(): string;
+  /**
+   * Serialize to a hash-carrying envelope (pass to {@link loadKge}). With
+   * `{ key }` (at least 16 bytes) the envelope also carries an HMAC-SHA256,
+   * so `loadKge(json, { key })` rejects any edit made without the key. The
+   * plain sha256 only catches corruption: anyone can recompute it.
+   */
+  save(opts?: { key?: string }): string;
   /** Model introspection. */
   stats(): Stats;
 }
@@ -117,7 +122,13 @@ function wrap<R extends string>(binding: Binding, model: ModelInstance): Kge<R> 
       parse<Record<string, unknown>>(model.evalJson(JSON.stringify(config ?? {}))),
     optimize: (spec) =>
       parse<OptimizeReport>(model.optimizeJson(JSON.stringify(spec ?? {}))),
-    save: () => model.toJson(),
+    save: (opts) => {
+      if (opts?.key === undefined) return model.toJson();
+      if (typeof model.toJsonSigned !== 'function') {
+        throw new KgeError('this binding cannot sign models; rebuild @ruvector/kge', 'unavailable');
+      }
+      return callOrInvalid(() => model.toJsonSigned!(opts.key!));
+    },
     stats: () => parse<Stats>(model.statsJson()),
   };
 }
@@ -144,12 +155,35 @@ export function createKge<R extends string = string>(
   return wrap<R>(binding, model);
 }
 
-/** Rebuild a model from a `save()` envelope; throws on a hash mismatch. */
+/**
+ * Rebuild a model from a `save()` envelope; throws on a hash mismatch. With
+ * `{ key }`, the envelope must also carry an HMAC that verifies under that
+ * key (see `save({ key })`); unsigned or edited envelopes throw
+ * `KgeError{kind:'invalid'}`.
+ */
 export function loadKge<R extends string = string>(
   modelJson: string,
-  opts: { binding?: Binding; schema?: Schema<R> } = {},
+  opts: { binding?: Binding; schema?: Schema<R>; key?: string } = {},
 ): Kge<R> {
   const binding = requireBinding(opts.binding);
+  if (opts.key !== undefined) {
+    const verify = binding.Model.fromJsonVerified;
+    if (typeof verify !== 'function') {
+      throw new KgeError('this binding cannot verify signed models; rebuild @ruvector/kge', 'unavailable');
+    }
+    const model = callOrInvalid(() => verify.call(binding.Model, modelJson, opts.key!));
+    return wrap<R>(binding, model);
+  }
   const model = binding.Model.fromJson(modelJson);
   return wrap<R>(binding, model);
+}
+
+/** Run a binding call that throws plain errors, rethrowing as KgeError{invalid}. */
+function callOrInvalid<T>(fn: () => T): T {
+  try {
+    return fn();
+  } catch (e) {
+    if (e instanceof KgeError) throw e;
+    throw new KgeError(e instanceof Error ? e.message : String(e), 'invalid');
+  }
 }

@@ -86,10 +86,15 @@ tails.candidates[0].entity;   // best-ranked object
 // Relation similarity (cosine over relation vectors):
 kge.similarRelations({ r: 'bornIn', k: 5 });
 
-// Save / restore (the envelope carries a sha256; load fails closed on a tamper):
+// Save / restore (the envelope carries a sha256; load fails closed on a mismatch):
 const saved = kge.save();
 import { loadKge } from '@ruvector/kge';
 const restored = loadKge(saved);
+
+// Signed save / restore: the envelope also carries an HMAC-SHA256 under your key
+// (at least 16 bytes), and load rejects edits made without it:
+const signed = kge.save({ key: process.env.KGE_MODEL_KEY });
+const trusted = loadKge(signed, { key: process.env.KGE_MODEL_KEY });
 ```
 
 Errors are thrown as `KgeError` with a `.kind` in
@@ -162,7 +167,12 @@ r.report.combined.mrr;
   (`scripts/check-wasm-imports.mjs`, run in the wasm build).
 - **Triple and label text is never logged**; errors carry numeric ids only.
 - **Saved models are content-hashed** (sha256 envelope); load fails closed on a
-  mismatch.
+  mismatch. The sha256 catches corruption, but anyone can recompute it after an
+  edit. For tamper evidence, save with `{ key }` and load with the same key:
+  the envelope then carries an HMAC-SHA256, and `loadKge` throws
+  `KgeError{kind:'invalid'}` for an unsigned, edited or wrongly keyed model.
+  Signed envelopes still load without a key. Signing needs a binding built from
+  this version (native, or a rebuilt WASM package).
 - **Input limits**, rejected with a typed error, never truncated: ≤ 1M
   entities, ≤ 100k relations, label ≤ 1 KiB, `k` ≤ 1000.
 

@@ -196,9 +196,25 @@ impl KgeModel {
     /// (ADR-005 manifest discipline). The hash covers the canonical struct
     /// serialization, so any edit to the payload — or to the hash — throws.
     pub fn from_json(json: &str) -> Result<Self, String> {
+        Self::load(json, None)
+    }
+
+    /// Like [`from_json`](Self::from_json), and additionally require an
+    /// `hmac_sha256` field that verifies under `key` (see
+    /// [`to_json_signed`](Self::to_json_signed)). The plain sha256 only
+    /// catches corruption, because anyone can recompute it; the HMAC also
+    /// catches a deliberate edit by someone without the key.
+    pub fn from_json_verified(json: &str, key: &str) -> Result<Self, String> {
+        check_key(key)?;
+        Self::load(json, Some(key))
+    }
+
+    fn load(json: &str, key: Option<&str>) -> Result<Self, String> {
         #[derive(Deserialize)]
         struct Envelope {
             sha256: String,
+            #[serde(default)]
+            hmac_sha256: Option<String>,
             model: serde_json::Value,
         }
         let env: Envelope =
@@ -208,6 +224,17 @@ impl KgeModel {
         let body = serde_json::to_string(&model).map_err(|e| e.to_string())?;
         if sha256_hex(body.as_bytes()) != env.sha256 {
             return Err("model hash mismatch: payload is tampered or corrupt".to_string());
+        }
+        if let Some(key) = key {
+            let Some(tag) = env.hmac_sha256.as_deref() else {
+                return Err("model is not signed: expected an hmac_sha256 field".to_string());
+            };
+            let expected = hmac_sha256_hex(key.as_bytes(), body.as_bytes());
+            if !constant_time_eq(expected.as_bytes(), tag.as_bytes()) {
+                return Err(
+                    "model signature mismatch: payload was edited or the key is wrong".to_string(),
+                );
+            }
         }
         model.entities.rebuild_index();
         model.relations.rebuild_index();
@@ -219,6 +246,20 @@ impl KgeModel {
         let body = serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string());
         let hash = sha256_hex(body.as_bytes());
         format!("{{\"sha256\":\"{hash}\",\"model\":{body}}}")
+    }
+
+    /// Serialize to `{"sha256","hmac_sha256","model"}`, where `hmac_sha256`
+    /// is HMAC-SHA256 of the same canonical body under `key` (at least 16
+    /// bytes). Loads with [`from_json`](Self::from_json) as before, or with
+    /// [`from_json_verified`](Self::from_json_verified) to require the key.
+    pub fn to_json_signed(&self, key: &str) -> Result<String, String> {
+        check_key(key)?;
+        let body = serde_json::to_string(self).map_err(|e| e.to_string())?;
+        let hash = sha256_hex(body.as_bytes());
+        let tag = hmac_sha256_hex(key.as_bytes(), body.as_bytes());
+        Ok(format!(
+            "{{\"sha256\":\"{hash}\",\"hmac_sha256\":\"{tag}\",\"model\":{body}}}"
+        ))
     }
 
     /// `{"scorer","dims","seed","entities","relations","triples","indexed"}`.
@@ -325,6 +366,48 @@ impl KgeModel {
     }
 }
 
+/// Minimum signing-key length in bytes.
+const MIN_KEY_BYTES: usize = 16;
+
+fn check_key(key: &str) -> Result<(), String> {
+    if key.len() < MIN_KEY_BYTES {
+        return Err(format!(
+            "signing key too short: need at least {MIN_KEY_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
+
+/// HMAC-SHA256 (RFC 2104) over `msg`, lowercase hex.
+fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
+    const BLOCK: usize = 64;
+    let mut k = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        k[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut inner = Sha256::new();
+    inner.update(k.map(|b| b ^ 0x36));
+    inner.update(msg);
+    let mut outer = Sha256::new();
+    outer.update(k.map(|b| b ^ 0x5c));
+    outer.update(inner.finalize());
+    hex(&outer.finalize())
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(64);
@@ -332,4 +415,56 @@ fn sha256_hex(bytes: &[u8]) -> String {
         out.push_str(&format!("{b:02x}"));
     }
     out
+}
+
+#[cfg(test)]
+mod envelope_tests {
+    use super::*;
+
+    const KEY: &str = "0123456789abcdef-test-key";
+
+    fn model() -> KgeModel {
+        KgeModel::new(r#"{"dims":8,"seed":1}"#).unwrap()
+    }
+
+    #[test]
+    fn hmac_matches_rfc4231_case_2() {
+        assert_eq!(
+            hmac_sha256_hex(b"Jefe", b"what do ya want for nothing?"),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    #[test]
+    fn signed_envelope_round_trips_and_still_loads_unkeyed() {
+        let signed = model().to_json_signed(KEY).unwrap();
+        assert!(signed.contains("\"hmac_sha256\""));
+        assert!(KgeModel::from_json_verified(&signed, KEY).is_ok());
+        assert!(KgeModel::from_json(&signed).is_ok());
+    }
+
+    #[test]
+    fn verification_rejects_a_recomputed_sha256_edit_a_wrong_key_and_unsigned_models() {
+        let signed = model().to_json_signed(KEY).unwrap();
+        // An editor without the key changes the payload and recomputes sha256.
+        let v: serde_json::Value = serde_json::from_str(&signed).unwrap();
+        let mut body = v["model"].clone();
+        body["config"]["seed"] = serde_json::json!(2);
+        let body_str = serde_json::to_string(&body).unwrap();
+        let reparsed: KgeModel = serde_json::from_str(&body_str).unwrap();
+        let canon = serde_json::to_string(&reparsed).unwrap();
+        let forged = format!(
+            "{{\"sha256\":\"{}\",\"hmac_sha256\":{},\"model\":{canon}}}",
+            sha256_hex(canon.as_bytes()),
+            v["hmac_sha256"]
+        );
+        assert!(
+            KgeModel::from_json(&forged).is_ok(),
+            "plain sha256 cannot catch this"
+        );
+        assert!(KgeModel::from_json_verified(&forged, KEY).is_err());
+        assert!(KgeModel::from_json_verified(&signed, "another-key-of-16b").is_err());
+        assert!(KgeModel::from_json_verified(&model().to_json(), KEY).is_err());
+        assert!(model().to_json_signed("short").is_err());
+    }
 }
