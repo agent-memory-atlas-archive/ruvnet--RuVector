@@ -180,6 +180,88 @@ pub(crate) fn geometry(state: &[f32], cp: &ClassProtos, not_for_lambda: f32) -> 
     }
 }
 
+/// Out-of-scope logit over every option except `skip` (the catch-all option,
+/// whose own text would otherwise be the nearest prototype for an off-topic
+/// state): same formula as [`Geometry::abstain_logit`].
+pub(crate) fn oos_logit_excluding(
+    state: &[f32],
+    cp: &ClassProtos,
+    skip: usize,
+    tau: f32,
+    scale: f32,
+) -> f32 {
+    let scale = if scale.abs() < f32::EPSILON {
+        0.5
+    } else {
+        scale
+    };
+    let mut max_sim = f32::NEG_INFINITY;
+    let mut best_not_for: Option<f32> = None;
+    for (i, (proto, nf)) in cp.protos.iter().zip(&cp.not_for).enumerate() {
+        if i == skip {
+            continue;
+        }
+        max_sim = max_sim.max(dot(state, proto));
+        if let Some(v) = nf {
+            let nfs = dot(state, v);
+            best_not_for = Some(best_not_for.map_or(nfs, |b: f32| b.max(nfs)));
+        }
+    }
+    let dist = (tau - max_sim) / scale;
+    match best_not_for {
+        Some(nf) => nf.max(dist),
+        None => dist,
+    }
+}
+
+/// Re-weight a `choice` answer around a catch-all option `k`: `k` gets the
+/// out-of-scope probability `p_oos`, every other option `(1 − p_oos)` times
+/// its share among the real options (the head never scores `k` itself), and
+/// the choice is `k` when `p_oos ≥ threshold`, else the best real option.
+pub(crate) fn apply_catch_all(
+    answer: Answer,
+    k: usize,
+    keys: &[String],
+    p_oos: f32,
+    threshold: f32,
+) -> Answer {
+    let Answer::Choice {
+        probabilities,
+        mut meta,
+        ..
+    } = answer
+    else {
+        return answer;
+    };
+    let mut probs = BTreeMap::new();
+    let mut best: Option<(&String, f32)> = None;
+    for (i, key) in keys.iter().enumerate() {
+        if i == k {
+            continue;
+        }
+        let p = (1.0 - p_oos) * probabilities.get(key).copied().unwrap_or(0.0);
+        let better = match best {
+            None => true,
+            Some((_, b)) => p > b,
+        };
+        if better {
+            best = Some((key, p));
+        }
+        probs.insert(key.clone(), p);
+    }
+    probs.insert(keys[k].clone(), p_oos);
+    let (choice, confidence) = match best {
+        Some((key, p)) if p_oos < threshold => (key.clone(), p),
+        _ => (keys[k].clone(), p_oos),
+    };
+    meta.confidence = confidence;
+    Answer::Choice {
+        choice,
+        probabilities: probs,
+        meta,
+    }
+}
+
 impl Geometry {
     /// Abstain logit: the larger of the best `not_for` match and a
     /// distance-to-nearest-prototype term. When no option carries a `not_for`,
