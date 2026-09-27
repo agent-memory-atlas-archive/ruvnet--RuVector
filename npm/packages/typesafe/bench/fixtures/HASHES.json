@@ -10,6 +10,7 @@
     "fixtures/tickets-truth.json": "3784fae9ef1ce5e4842144b9e7eb1b0d289e4af3549e935bb2e27126b6cdc642"
   },
   "derived": {
-    "fixtures/novel-slice-2026-09-26.json": "4e3716f827c4bfa3f1e2c619b85a7113dc17525884984b5b3f600ad95a5b635b"
+    "fixtures/novel-slice-2026-09-26.json": "4e3716f827c4bfa3f1e2c619b85a7113dc17525884984b5b3f600ad95a5b635b",
+    "jev-live-2026-09-25.json": "9909f49a98167aa8ad2867d3afffda08e008a9de7dde61eec5e581d73b876f3b"
   }
 }

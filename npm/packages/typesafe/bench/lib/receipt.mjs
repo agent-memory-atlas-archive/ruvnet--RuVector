@@ -69,7 +69,7 @@ export function scoreRecords(records, { departments, wallMs, majorityLabels } = 
     if (withScore.length === urgentRecs.length && withScore.length) {
       block.urgent_auroc = auroc(withScore.map((r) => r.urgent.score), withScore.map((r) => !!r.urgent.label));
     } else {
-      block.urgent_auroc = null; // Jev exposes no noul probability
+      block.urgent_auroc = null; // the arm's capture kept no continuous noul
     }
   }
   const frRecs = records.filter((r) => r.frustration);
