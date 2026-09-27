@@ -159,3 +159,22 @@ test('integrates with the default native/WASM binding when one is present', asyn
   assert.equal(typeof r.dept.confidence, 'number');
   assert.ok('billing' in r.dept.probabilities);
 });
+
+test('hash embedder warns once per process, and can be silenced', async () => {
+  const { fileURLToPath } = await import('node:url');
+  const pkg = fileURLToPath(new URL('..', import.meta.url));
+  const count = (stderr) => (stderr.match(/TYPESAFE_HASH_EMBEDDER/g) || []).length;
+  const { spawnSync } = await import('node:child_process');
+  const stderrOf = (body) => spawnSync(process.execPath, ['-e', `
+      const { createTypesafe } = require('./dist/index.js');
+      const binding = require('./test/fixtures/fake-binding.cjs');
+      ${body}
+    `], { cwd: pkg, encoding: 'utf8' }).stderr;
+  assert.equal(count(stderrOf('createTypesafe({ binding }); createTypesafe({ binding });')), 1, 'default (hash) warns exactly once');
+  assert.equal(count(stderrOf('createTypesafe({ binding, warnOnHashEmbedder: false });')), 0, 'opt-out is silent');
+  assert.equal(
+    count(stderrOf("createTypesafe({ binding, embedder: { kind: 'onnx', modelDir: 'm', manifest: 'm/manifest.json' } });")),
+    0,
+    'onnx does not warn',
+  );
+});
