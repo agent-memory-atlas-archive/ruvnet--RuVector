@@ -12,7 +12,7 @@ impl<E: Embedder> crate::engine::Engine<E> {
         let allow_cal = !model_id.ends_with("@test-double");
 
         // Compile the scorer once (embed criteria / legend / predicate).
-        let qtexts = question_texts(&spec.question_def);
+        let qtexts = question_texts(&spec.question_def, spec.base_options.choice_instructions);
         let qrefs: Vec<&str> = qtexts.iter().map(String::as_str).collect();
         let qembs = if qrefs.is_empty() {
             Vec::new()

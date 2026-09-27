@@ -33,6 +33,12 @@ export interface EngineTuning {
   calibrationFraction?: number;
   minCalibration?: number;
   head?: 'auto' | 'prototype' | 'probe';
+  /**
+   * Prefix a `choice` question's `instructions` to each option before
+   * embedding, as `score` already does. Off by default: `choice` embeds only
+   * the criteria, so its instructions do not change the answer.
+   */
+  choiceInstructions?: boolean;
 }
 
 /** One labeled campaign row with an explicit frozen split. */

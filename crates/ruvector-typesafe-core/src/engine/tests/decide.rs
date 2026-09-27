@@ -175,3 +175,65 @@ fn a_limits_violation_surfaces_as_a_limit_error() {
     let req = topic_request(&big);
     assert!(matches!(engine.decide(&req), Err(TypesafeError::Limit(_))));
 }
+
+fn instructed_choice(instructions: &str) -> DecisionRequest {
+    let mut req = choice_request(
+        "the customer wants to sell their shares",
+        vec![
+            (
+                "shares",
+                structured("company shares equity stock", &[], None),
+            ),
+            (
+                "bonds",
+                structured("government bonds fixed income", &[], None),
+            ),
+        ],
+    );
+    if let Some(Question::Choice {
+        instructions: i, ..
+    }) = req.questions.get_mut("q")
+    {
+        *i = instructions.to_string();
+    }
+    req
+}
+
+fn choice_probs(engine: &Engine<HashEmbedder>, req: &DecisionRequest) -> BTreeMap<String, f32> {
+    let r = engine.decide(req).unwrap();
+    as_choice(&r.answers["q"]).1.clone()
+}
+
+#[test]
+fn choice_instructions_are_ignored_by_default() {
+    // Original behaviour: `choice` embeds only the criteria.
+    let engine = Engine::new(HashEmbedder::new(DIMS));
+    let own = choice_probs(&engine, &instructed_choice("which asset do they own"));
+    let avoid = choice_probs(&engine, &instructed_choice("which asset do they avoid"));
+    assert_eq!(own, avoid);
+}
+
+#[test]
+fn choice_instructions_opt_in_changes_the_prototypes() {
+    let opts = EngineOptions {
+        choice_instructions: true,
+        ..EngineOptions::default()
+    };
+    let on = Engine::with_options(HashEmbedder::new(DIMS), opts);
+    let off = Engine::new(HashEmbedder::new(DIMS));
+
+    // With instructions present, the opt-in embeds "instructions. option", so
+    // the same request scores differently than on the default path.
+    let asked = instructed_choice("which asset does the customer want to sell");
+    assert_ne!(
+        choice_probs(&on, &asked),
+        choice_probs(&off, &asked),
+        "instructions should now reach the prototypes"
+    );
+
+    // Empty instructions: bit-identical to the default path.
+    assert_eq!(
+        choice_probs(&on, &instructed_choice("")),
+        choice_probs(&off, &instructed_choice(""))
+    );
+}
