@@ -465,13 +465,19 @@ impl<E: Embedder> Engine<E> {
         }
         let bank = self.bank.read().unwrap();
         let explicit = bank.iter_split(question, Split::Calibration).count();
+        let train = bank.iter_split(question, Split::Train).count();
+        // Cross-fitting pools every label, so the slice size no longer gates it
+        // (provisional: a fold missing a class still falls back at fit time).
+        if self.options.crossfit_calibration
+            && train + explicit >= self.options.min_calibration.max(fit::CROSSFIT_FOLDS)
+        {
+            return true;
+        }
         if explicit > 0 {
             return explicit >= self.options.min_calibration;
         }
         let stride = self.options.calib_stride();
-        let calib = (0..bank.iter_split(question, Split::Train).count())
-            .filter(|&i| is_calib_pos(i, stride))
-            .count();
+        let calib = (0..train).filter(|&i| is_calib_pos(i, stride)).count();
         calib >= self.options.min_calibration
     }
 

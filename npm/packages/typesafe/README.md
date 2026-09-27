@@ -140,6 +140,20 @@ embedder:
 const ts = createTypesafe({ embedder: { kind: 'onnx', modelDir: './models/bge', manifest: './models/manifest.json' } });
 ```
 
+
+### Calibration with few labels
+
+`confidence` is calibrated (`calibrated: true`) once the held-out calibration
+slice reaches `minCalibration` (20) examples; with the default every-5th split
+that takes about 100 labels per question. Below that, pass
+`createTypesafe({ engine: { crossfitCalibration: true } })`: the temperature
+(or the `noul` Platt layer) is then fitted on 5-fold out-of-fold scores over all
+labels, so 20 labels in total are enough. The head that answers is unchanged,
+so choices and accuracy are identical. On CFPB product routing (11 classes,
+bge-small, 600 test complaints, 3 samples each) it cut ECE from 0.23 to 0.13
+with 66 labels and from 0.23 to 0.09 with 88; at 110 labels the held-out slice
+is large enough and both settings give the same answers.
+
 ## The self-optimization loop
 
 Improvement is a governed, measured, reversible loop (ADR-004): a proposal must

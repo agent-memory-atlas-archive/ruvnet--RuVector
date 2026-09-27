@@ -56,6 +56,13 @@ pub struct EngineOptions {
     pub min_calibration: usize,
     /// Head selection for class questions.
     pub head: HeadChoice,
+    /// When the held-out calibration slice is below `min_calibration`, fit the
+    /// temperature (class heads) or Platt layer (`noul`) on 5-fold out-of-fold
+    /// scores over train ∪ calibration instead of leaving the answer
+    /// uncalibrated. Needs only `min_calibration` labels in total rather than
+    /// in the slice (about 5× fewer by default). Off by default (original
+    /// behaviour); the served head is unchanged, only its calibration layer.
+    pub crossfit_calibration: bool,
 }
 
 impl Default for EngineOptions {
@@ -72,6 +79,7 @@ impl Default for EngineOptions {
             calibration_fraction: 0.2,
             min_calibration: 20,
             head: HeadChoice::Auto,
+            crossfit_calibration: false,
         }
     }
 }

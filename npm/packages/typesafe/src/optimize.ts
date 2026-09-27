@@ -33,6 +33,12 @@ export interface EngineTuning {
   calibrationFraction?: number;
   minCalibration?: number;
   head?: 'auto' | 'prototype' | 'probe';
+  /**
+   * When the held-out calibration slice is below `minCalibration`, fit the
+   * temperature / Platt layer on 5-fold out-of-fold scores over all labels
+   * instead of leaving answers uncalibrated. Off by default.
+   */
+  crossfitCalibration?: boolean;
 }
 
 /** One labeled campaign row with an explicit frozen split. */
