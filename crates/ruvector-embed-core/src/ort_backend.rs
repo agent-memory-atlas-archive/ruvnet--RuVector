@@ -149,7 +149,13 @@ impl OrtEmbedder {
 
 impl Embedder for OrtEmbedder {
     fn embed(&self, texts: &[&str]) -> CoreResult<Vec<Vec<f32>>> {
-        Ok(self.embed_impl(texts)?)
+        // Bounded batches: one forward pass over thousands of texts can ask
+        // onnxruntime for gigabytes of attention memory (see MAX_EMBED_BATCH).
+        Ok(crate::embed_in_chunks(
+            texts,
+            crate::MAX_EMBED_BATCH,
+            |c| self.embed_impl(c),
+        )?)
     }
     fn dims(&self) -> usize {
         self.manifest.dims
