@@ -31,6 +31,36 @@ pub(super) fn carve_calibration<T: Clone>(items: Vec<T>, stride: usize) -> (Vec<
     (train, calib)
 }
 
+/// The (train, calibration) pair for a question: when the caller supplied an
+/// explicit calibration slice (bank `Calibration` split, ADR-008 §4) the head
+/// trains on every `Train` row and calibrates on exactly that slice; otherwise
+/// the positional carve applies, bit-identical to the original behaviour.
+pub(super) fn split_or_carve<T: Clone>(
+    train: Vec<T>,
+    explicit_calib: Vec<T>,
+    stride: usize,
+) -> (Vec<T>, Vec<T>) {
+    if explicit_calib.is_empty() {
+        carve_calibration(train, stride)
+    } else {
+        (train, explicit_calib)
+    }
+}
+
+/// The carve stride the head actually uses for `question`: disabled
+/// (`usize::MAX`) once an explicit calibration slice exists.
+pub(super) fn effective_stride(bank: &crate::bank::Bank, question: &str, stride: usize) -> usize {
+    if bank
+        .iter_split(question, crate::bank::Split::Calibration)
+        .next()
+        .is_some()
+    {
+        usize::MAX
+    } else {
+        stride
+    }
+}
+
 /// Normalise a `noul` label to `1.0` / `0.0`, or `None` if it is neither.
 pub(super) fn parse_noul_label(label: &str) -> Option<f32> {
     match label.trim().to_lowercase().as_str() {

@@ -9811,6 +9811,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruvector-gpu-runner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "ctrlc",
+ "serde",
+ "serde_json",
+ "ureq 2.12.1",
+]
+
+[[package]]
 name = "ruvector-graph"
 version = "2.3.2"
 dependencies = [
@@ -11079,6 +11092,29 @@ dependencies = [
  "ruvector-typesafe-core",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "ruvector-typesafe-train"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "candle-core 0.9.2",
+ "candle-nn 0.9.2",
+ "clap",
+ "prost 0.14.4",
+ "rand 0.8.6",
+ "rand_chacha 0.3.1",
+ "regex",
+ "ruvector-embed-core",
+ "ruvector-typesafe-core",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "toml",
+ "tract-onnx",
+ "unicode-normalization",
+ "ureq 2.12.1",
 ]
 
 [[package]]

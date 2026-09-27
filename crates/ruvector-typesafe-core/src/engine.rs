@@ -192,6 +192,42 @@ impl<E: Embedder> Engine<E> {
     /// Criteria arrive only at `decide` time, so a label that matches no
     /// criterion is simply ignored by the head then.
     pub fn train(&mut self, question: &str, examples: &[LabeledExample]) -> Result<TrainReport> {
+        let (accepted, rejected) = self.admit_rows(question, examples, None)?;
+        Ok(self.report(question, accepted, rejected))
+    }
+
+    /// [`train`](Self::train) plus an explicit calibration slice (ADR-008 §4),
+    /// admitted into the bank's `Calibration` split: temperature / Platt then fit
+    /// on exactly those rows and the head on all `Train` rows (no carve).
+    pub fn train_with_calibration(
+        &mut self,
+        question: &str,
+        examples: &[LabeledExample],
+        calibration: &[LabeledExample],
+    ) -> Result<TrainReport> {
+        let (a1, r1) = self.admit_rows(question, examples, None)?;
+        let (a2, r2) = self.admit_rows(question, calibration, Some(Split::Calibration))?;
+        Ok(self.report(question, a1 + a2, r1 + r2))
+    }
+
+    fn report(&self, question: &str, accepted: usize, rejected: usize) -> TrainReport {
+        TrainReport {
+            question: question.to_string(),
+            accepted,
+            rejected,
+            head: self.provisional_head(question),
+            calibrated: self.provisional_calibrated(question),
+        }
+    }
+
+    /// Admit rows into `split` (`None`: the bank's ratio assignment, i.e. the
+    /// plain `train` path). Returns `(accepted, rejected)`.
+    fn admit_rows(
+        &mut self,
+        question: &str,
+        examples: &[LabeledExample],
+        split: Option<Split>,
+    ) -> Result<(usize, usize)> {
         let valid = |e: &&LabeledExample| !e.text.trim().is_empty() && !e.label.trim().is_empty();
         let filtered: Vec<&LabeledExample> = examples.iter().filter(valid).collect();
         let rejected = examples.len() - filtered.len();
@@ -230,7 +266,11 @@ impl<E: Embedder> Engine<E> {
             let mut bank = self.bank.write().unwrap();
             let mut embeds = self.embeds.write().unwrap();
             for e in filtered {
-                match bank.admit(question, &e.text, &e.label, TrustTier::A) {
+                let admission = match split {
+                    None => bank.admit(question, &e.text, &e.label, TrustTier::A),
+                    Some(sp) => bank.admit_into(question, &e.text, &e.label, TrustTier::A, sp),
+                };
+                match admission {
                     Admission::Accepted(id) => {
                         let pos = positions[&(e.text.as_str(), e.label.as_str())];
                         // A content identity can be accepted only once. Prior
@@ -249,14 +289,7 @@ impl<E: Embedder> Engine<E> {
             let mut gens = self.train_gen.write().unwrap();
             *gens.entry(question.to_string()).or_insert(0) += 1;
         }
-
-        Ok(TrainReport {
-            question: question.to_string(),
-            accepted,
-            rejected,
-            head: self.provisional_head(question),
-            calibrated: self.provisional_calibrated(question),
-        })
+        Ok((accepted, rejected))
     }
 
     /// Full-fidelity bank JSON (the user's own examples) for `typesafe train
@@ -363,7 +396,14 @@ impl<E: Embedder> Engine<E> {
                 Some((emb, ci))
             })
             .collect();
-        carve_calibration(relevant, self.options.calib_stride())
+        let explicit: Vec<(Vec<f32>, usize)> = bank
+            .iter_split(question, Split::Calibration)
+            .filter_map(|e| {
+                let ci = *index.get(e.label.as_str())?;
+                Some((embeds.get(&e.id.0)?.clone(), ci))
+            })
+            .collect();
+        split_or_carve(relevant, explicit, self.options.calib_stride())
     }
 
     #[allow(clippy::type_complexity)]
@@ -378,7 +418,14 @@ impl<E: Embedder> Engine<E> {
                 Some((emb, y))
             })
             .collect();
-        carve_calibration(relevant, self.options.calib_stride())
+        let explicit: Vec<(Vec<f32>, f32)> = bank
+            .iter_split(question, Split::Calibration)
+            .filter_map(|e| {
+                let y = parse_noul_label(&e.label)?;
+                Some((embeds.get(&e.id.0)?.clone(), y))
+            })
+            .collect();
+        split_or_carve(relevant, explicit, self.options.calib_stride())
     }
 
     /// The head a `TrainReport` announces, from the bank's Train split for this
@@ -386,7 +433,7 @@ impl<E: Embedder> Engine<E> {
     /// `decide` will pick under the current options).
     fn provisional_head(&self, question: &str) -> Head {
         let bank = self.bank.read().unwrap();
-        let stride = self.options.calib_stride();
+        let stride = effective_stride(&bank, question, self.options.calib_stride());
         let mut counts: BTreeMap<String, usize> = BTreeMap::new();
         for (i, e) in bank.iter_split(question, Split::Train).enumerate() {
             if is_calib_pos(i, stride) {
@@ -417,6 +464,10 @@ impl<E: Embedder> Engine<E> {
             return false;
         }
         let bank = self.bank.read().unwrap();
+        let explicit = bank.iter_split(question, Split::Calibration).count();
+        if explicit > 0 {
+            return explicit >= self.options.min_calibration;
+        }
         let stride = self.options.calib_stride();
         let calib = (0..bank.iter_split(question, Split::Train).count())
             .filter(|&i| is_calib_pos(i, stride))
@@ -440,7 +491,8 @@ impl<E: Embedder> Engine<E> {
 
 mod support;
 use support::{
-    carve_calibration, is_calib_pos, is_test_double, mix, parse_noul_label, stable_hash,
+    effective_stride, is_calib_pos, is_test_double, mix, parse_noul_label, split_or_carve,
+    stable_hash,
 };
 
 #[cfg(all(test, feature = "hash-embedder"))]

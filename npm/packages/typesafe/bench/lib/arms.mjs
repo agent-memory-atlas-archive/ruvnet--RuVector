@@ -136,14 +136,19 @@ export function fewShotExamples(trainItems, labelKey, shots, { labelMap } = {}) 
  * named question on the train split. Returns training metadata
  * (never throws for a missing trainJson — zero-shot engines simply skip).
  */
-export function trainFewShot(engine, trainItems, { shots = 8, question = 'department', labelKey = 'department', labelMap } = {}) {
+export function trainFewShot(engine, trainItems, { shots = 8, question = 'department', labelKey = 'department', labelMap, calibrationItems } = {}) {
   if (typeof engine.trainJson !== 'function') {
     return { trained: false, reason: 'engine has no trainJson' };
   }
   const { examples, effective } = fewShotExamples(trainItems, labelKey, shots, { labelMap });
+  // ADR-008 §4: an explicit held-out calibration slice (every row, no shot cap).
+  // Absent → the engine carves its calibration slice from `examples` (default).
+  const calibration = calibrationItems?.length
+    ? fewShotExamples(calibrationItems, labelKey, Infinity, { labelMap }).examples
+    : undefined;
   let out;
   try {
-    out = engine.trainJson(JSON.stringify({ question, examples }));
+    out = engine.trainJson(JSON.stringify(calibration ? { question, examples, calibration } : { question, examples }));
   } catch (e) {
     return { trained: false, error: String(e && e.message ? e.message : e) };
   }
@@ -154,13 +159,13 @@ export function trainFewShot(engine, trainItems, { shots = 8, question = 'depart
     /* trainJson may return a non-JSON status string */
   }
   if (parsed && parsed.error) return { trained: false, error: parsed.error };
-  return { trained: true, shots, shotsEffective: effective, examplesUsed: examples.length };
+  return { trained: true, shots, shotsEffective: effective, examplesUsed: examples.length, calibrationUsed: calibration?.length ?? 0 };
 }
 
 /** Train every frozen tickets question from the same train-only pool. The
  * per-class shot cap applies independently to each head; score labels must be
  * the actual legend strings, while noul needs positive/negative labels. */
-export function trainTicketQuestions(engine, trainItems, questionDefs, { shots = 8 } = {}) {
+export function trainTicketQuestions(engine, trainItems, questionDefs, { shots = 8, calibrationItems } = {}) {
   const legend = questionDefs.frustration?.criteria;
   if (questionDefs.department?.type !== 'choice' ||
       questionDefs.urgent?.type !== 'noul' ||
@@ -169,12 +174,12 @@ export function trainTicketQuestions(engine, trainItems, questionDefs, { shots =
     throw new Error('tickets fixture is missing a choice, noul, or score definition');
   }
   const questions = {
-    department: trainFewShot(engine, trainItems, { shots, question: 'department', labelKey: 'department' }),
+    department: trainFewShot(engine, trainItems, { shots, question: 'department', labelKey: 'department', calibrationItems }),
     urgent: trainFewShot(engine, trainItems, {
-      shots, question: 'urgent', labelKey: 'urgent', labelMap: { true: 'yes', false: 'no' },
+      shots, question: 'urgent', labelKey: 'urgent', labelMap: { true: 'yes', false: 'no' }, calibrationItems,
     }),
     frustration: trainFewShot(engine, trainItems, {
-      shots, question: 'frustration', labelKey: 'frustration',
+      shots, question: 'frustration', labelKey: 'frustration', calibrationItems,
       labelMap: Object.fromEntries(legend.map((label, index) => [String(index), label])),
     }),
   };

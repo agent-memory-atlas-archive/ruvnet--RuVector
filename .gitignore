@@ -206,3 +206,7 @@ crates/ruvector-hailo-cluster/Cargo.lock
 crates/hailort-sys/Cargo.lock
 crates/ruvector-mmwave/Cargo.lock
 node_modules
+
+# OpenJev trainer working dir (data, caches, checkpoints; never committed)
+/runs/
+/target-cuda/
