@@ -22,6 +22,13 @@ export interface RuvLLMConfig {
   qualityThreshold?: number;
   /** EWC lambda (default: 2000) */
   ewcLambda?: number;
+  /**
+   * Throw instead of warning when the engine cannot produce language-model
+   * text: when a `modelPath` is passed (this package does not load GGUF
+   * files), and when `generate()`/`query()` would return text from the
+   * native engine, which has no language-model weights. Default false.
+   */
+  strict?: boolean;
 }
 
 /**
