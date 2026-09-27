@@ -11075,7 +11075,6 @@ dependencies = [
 name = "ruvector-typesafe-core"
 version = "2.3.0"
 dependencies = [
- "ruvector-router-core",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
