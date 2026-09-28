@@ -27,6 +27,7 @@ import {
   LabeledExample,
   QuestionWire,
   ScoreQuestionWire,
+  TrainOptions,
   TrainReport,
   Usage,
 } from './types';
@@ -34,6 +35,35 @@ import {
 export interface TypesafeOptions extends EngineOptions {
   /** Inject a binding (tests, or a non-default addon). Defaults to `../index.js`. */
   binding?: Binding;
+  /**
+   * Emit a one-time process warning when the `hash` test embedder is used
+   * (the default when `embedder` is omitted). Defaults to `true`; set `false`
+   * in tests or wiring code that uses `hash` on purpose.
+   */
+  warnOnHashEmbedder?: boolean;
+}
+
+let hashWarningEmitted = false;
+
+/** Warn once per process: `hash` answers carry no meaning on real text. */
+function maybeWarnHashEmbedder(opts: TypesafeOptions): void {
+  const usesHash = opts.embedder === undefined || opts.embedder === 'hash';
+  if (!usesHash || opts.warnOnHashEmbedder === false || hashWarningEmitted) return;
+  hashWarningEmitted = true;
+  const message =
+    '@ruvector/typesafe is using the "hash" test embedder (the default). Its answers are ' +
+    'not meaningful for real text; pass { embedder: { kind: "onnx", modelDir, manifest } } ' +
+    'for real decisions, or { warnOnHashEmbedder: false } to silence this in tests.';
+  // Reached through globalThis so the package compiles without Node or DOM typings.
+  const g = globalThis as unknown as {
+    process?: { emitWarning?: (m: string, o?: { code?: string }) => void };
+    console?: { warn?: (m: string) => void };
+  };
+  if (typeof g.process?.emitWarning === 'function') {
+    g.process.emitWarning(message, { code: 'TYPESAFE_HASH_EMBEDDER' });
+  } else {
+    g.console?.warn?.(message);
+  }
 }
 
 /**
@@ -88,7 +118,17 @@ export interface Typesafe {
     opts?: DecideManyOptions,
   ): Promise<Array<DecisionResult<Q>>>;
   systemOne(body: SystemOneBody, opts?: SystemOneOptions): Promise<DecisionResponse>;
-  train(questionId: string, examples: readonly LabeledExample[]): Promise<TrainReport>;
+  /**
+   * Admit labelled examples for one question. Pass `{ kind }` (`'choice'`,
+   * `'score'` or `'noul'`) so `TrainReport.head` matches the head `decide`
+   * will use; without it the head is inferred from the labels, and
+   * boolean-looking labels (`yes`/`no`) are reported as `logistic`.
+   */
+  train(
+    questionId: string,
+    examples: readonly LabeledExample[],
+    opts?: TrainOptions,
+  ): Promise<TrainReport>;
   /**
    * Run an optimize campaign (ADR-004) over `EngineTuning` for this engine's
    * embedder: a gated grid search that promotes only through the paired
@@ -205,6 +245,7 @@ export function createTypesafe(opts: TypesafeOptions = {}): Typesafe {
       'embedder',
     );
   }
+  maybeWarnHashEmbedder(opts);
   const engine = new binding.Engine(toOptionsJson(opts));
 
   async function decide<Q extends Record<string, AnyQuestion>>(
@@ -256,8 +297,11 @@ export function createTypesafe(opts: TypesafeOptions = {}): Typesafe {
   async function train(
     questionId: string,
     examples: readonly LabeledExample[],
+    opts?: TrainOptions,
   ): Promise<TrainReport> {
-    const payload = JSON.stringify({ question: questionId, examples });
+    const payload = JSON.stringify(
+      opts?.kind ? { question: questionId, examples, kind: opts.kind } : { question: questionId, examples },
+    );
     const parsed: unknown = JSON.parse(engine.trainJson(payload));
     if (isErrorShape(parsed)) {
       throw new TypesafeError(parsed.error.message, parsed.error.kind);

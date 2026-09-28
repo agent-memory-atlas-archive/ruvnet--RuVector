@@ -33,6 +33,35 @@ export interface EngineTuning {
   calibrationFraction?: number;
   minCalibration?: number;
   head?: 'auto' | 'prototype' | 'probe';
+  /**
+   * Prefix a `choice` question's `instructions` to each option before
+   * embedding, as `score` already does. Off by default: `choice` embeds only
+   * the criteria, so its instructions do not change the answer.
+   */
+  choiceInstructions?: boolean;
+  /**
+   * How `abstain` is reported. `'softmax'` (default) is the abstain share of a
+   * (K+1)-way softmax, which shrinks with the option count and after training.
+   * `'sigmoid'` reports the same out-of-scope signal on a fixed 0–1 scale, so
+   * one threshold carries across questions. Choices, probabilities and
+   * confidence are identical in both modes.
+   */
+  abstainMode?: 'softmax' | 'sigmoid';
+  /**
+   * When the held-out calibration slice is below `minCalibration`, fit the
+   * temperature / Platt layer on 5-fold out-of-fold scores over all labels
+   * instead of leaving answers uncalibrated. Off by default.
+   */
+  crossfitCalibration?: boolean;
+  /**
+   * Key of a catch-all option (e.g. `'other'`) in `choice` questions. Off by
+   * default. When set, that option's text is not matched; its probability is
+   * the out-of-scope score over the other options, and it is chosen at
+   * `catchAllThreshold`.
+   */
+  catchAll?: string;
+  /** Probability at which the catch-all is chosen (default 0.5). Tune per question. */
+  catchAllThreshold?: number;
 }
 
 /** One labeled campaign row with an explicit frozen split. */
@@ -60,6 +89,13 @@ export interface CampaignSpec {
   day_key?: string;
   created_seq_base?: number;
   created?: string | null;
+  /**
+   * Receipt chain hash: `'fnv1a128'` (default; catches accidental edits) or
+   * `'sha256'` (tamper-evident once the last hash is anchored somewhere the
+   * log's editor cannot change). Hashes record their algorithm, so old logs
+   * still verify.
+   */
+  receipt_hash?: 'fnv1a128' | 'sha256';
 }
 
 /** A pair of accuracies on one split (mirrors `receipt::Metrics`). */

@@ -131,6 +131,21 @@ test('train forwards the payload and returns the TrainReport', async () => {
   void sent;
 });
 
+test('train forwards an optional question kind', async () => {
+  const { binding, holder } = makeBinding();
+  const ts = createTypesafe({ binding });
+  const sent = [];
+  const orig = holder.engine.trainJson.bind(holder.engine);
+  holder.engine.trainJson = (json) => {
+    sent.push(JSON.parse(json));
+    return orig(json);
+  };
+  await ts.train('dept', [{ text: 't', label: 'yes' }], { kind: 'choice' });
+  await ts.train('dept', [{ text: 't', label: 'yes' }]);
+  assert.equal(sent[0].kind, 'choice', 'kind is sent when given');
+  assert.ok(!('kind' in sent[1]), 'no kind field without the option (wire format unchanged)');
+});
+
 test('version and backend surface the binding metadata', async () => {
   const { binding } = makeBinding();
   const ts = createTypesafe({ binding });
@@ -158,4 +173,23 @@ test('integrates with the default native/WASM binding when one is present', asyn
   assert.ok(r.dept.choice === 'billing' || r.dept.choice === 'fraud');
   assert.equal(typeof r.dept.confidence, 'number');
   assert.ok('billing' in r.dept.probabilities);
+});
+
+test('hash embedder warns once per process, and can be silenced', async () => {
+  const { fileURLToPath } = await import('node:url');
+  const pkg = fileURLToPath(new URL('..', import.meta.url));
+  const count = (stderr) => (stderr.match(/TYPESAFE_HASH_EMBEDDER/g) || []).length;
+  const { spawnSync } = await import('node:child_process');
+  const stderrOf = (body) => spawnSync(process.execPath, ['-e', `
+      const { createTypesafe } = require('./dist/index.js');
+      const binding = require('./test/fixtures/fake-binding.cjs');
+      ${body}
+    `], { cwd: pkg, encoding: 'utf8' }).stderr;
+  assert.equal(count(stderrOf('createTypesafe({ binding }); createTypesafe({ binding });')), 1, 'default (hash) warns exactly once');
+  assert.equal(count(stderrOf('createTypesafe({ binding, warnOnHashEmbedder: false });')), 0, 'opt-out is silent');
+  assert.equal(
+    count(stderrOf("createTypesafe({ binding, embedder: { kind: 'onnx', modelDir: 'm', manifest: 'm/manifest.json' } });")),
+    0,
+    'onnx does not warn',
+  );
 });

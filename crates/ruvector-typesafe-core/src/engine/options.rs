@@ -20,6 +20,25 @@ pub enum HeadChoice {
     Probe,
 }
 
+/// How `meta.abstain` is reported for `choice` / `score` answers.
+///
+/// `Softmax` (default, original behaviour) reports the abstain logit's share of
+/// a (K+1)-way softmax with the option scores, after the fitted temperature. Its
+/// scale shrinks as the option count K grows, and after training a sharp fitted
+/// temperature pushes it towards zero, so one threshold does not carry across
+/// questions. `Sigmoid` reports `sigmoid(abstain_logit)`: the same
+/// out-of-scope signal (distance to the nearest prototype, or the best
+/// `not_for` match) on a fixed 0–1 scale that does not depend on K or on the
+/// head's temperature. `choice`, `probabilities` and `confidence` are identical
+/// in both modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AbstainMode {
+    #[default]
+    Softmax,
+    Sigmoid,
+}
+
 /// The engine's tunable parameters. Defaults reproduce the original constants:
 /// probe `lr=0.8, l2=1e-3, iters=400`; `not_for` λ = 0.5; abstain τ = 0.35,
 /// scale = 0.5; logit scale = 1.0 (no sharpening); calibration slice = 20 %
@@ -56,6 +75,32 @@ pub struct EngineOptions {
     pub min_calibration: usize,
     /// Head selection for class questions.
     pub head: HeadChoice,
+    /// Prefix a `choice` question's `instructions` to each option's `what`,
+    /// examples and `not_for` before embedding, as `score` already does for
+    /// its legend. Off by default (original behaviour: `choice` embeds only
+    /// the criteria, so its instructions do not affect the answer).
+    pub choice_instructions: bool,
+    /// How `meta.abstain` is reported (see [`AbstainMode`]). Default `Softmax`.
+    pub abstain_mode: AbstainMode,
+    /// When the held-out calibration slice is below `min_calibration`, fit the
+    /// temperature (class heads) or Platt layer (`noul`) on 5-fold out-of-fold
+    /// scores over train ∪ calibration instead of leaving the answer
+    /// uncalibrated. Needs only `min_calibration` labels in total rather than
+    /// in the slice (about 5× fewer by default). Off by default (original
+    /// behaviour); the served head is unchanged, only its calibration layer.
+    pub crossfit_calibration: bool,
+    /// Key of a catch-all option (e.g. `"other"`) in `choice` questions. Off
+    /// by default (`None`: every option, including one named "other", is an
+    /// ordinary option). When set and the question has that key, the option's
+    /// own text is not scored; its probability is `sigmoid` of the
+    /// out-of-scope logit over the other options (distance to their nearest
+    /// prototype, or the best `not_for` match), and it is chosen when that
+    /// probability reaches `catch_all_threshold`.
+    pub catch_all: Option<String>,
+    /// Probability at which the catch-all option is chosen. Tune it on
+    /// labelled in-scope and off-topic examples; the useful range depends on
+    /// the embedder (about 0.34 for bge-small with the default τ and scale).
+    pub catch_all_threshold: f32,
 }
 
 impl Default for EngineOptions {
@@ -72,6 +117,11 @@ impl Default for EngineOptions {
             calibration_fraction: 0.2,
             min_calibration: 20,
             head: HeadChoice::Auto,
+            choice_instructions: false,
+            abstain_mode: AbstainMode::Softmax,
+            crossfit_calibration: false,
+            catch_all: None,
+            catch_all_threshold: 0.5,
         }
     }
 }

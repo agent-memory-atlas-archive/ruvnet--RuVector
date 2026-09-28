@@ -34,6 +34,73 @@ pub mod ort_backend;
 pub mod tract_backend;
 
 pub use error::{EmbedError, Result};
+
+/// Largest number of texts sent to the model in one forward pass.
+///
+/// The ORT backend pads a whole batch to its longest sequence and runs it as
+/// one tensor, so memory grows with `batch × seq²` in attention. Embedding
+/// thousands of texts in one call (e.g. `train()` with a large labelled set)
+/// asked onnxruntime for a 10 GB buffer. Chunking keeps peak memory bounded
+/// and does not change the results: each text's vector depends only on that
+/// text (padding is masked out).
+pub const MAX_EMBED_BATCH: usize = 32;
+
+/// Run `f` over `texts` in chunks of at most `max` (0 is treated as 1) and
+/// concatenate the outputs in order.
+pub fn embed_in_chunks<T, E>(
+    texts: &[&str],
+    max: usize,
+    mut f: impl FnMut(&[&str]) -> std::result::Result<Vec<T>, E>,
+) -> std::result::Result<Vec<T>, E> {
+    let mut out = Vec::with_capacity(texts.len());
+    for chunk in texts.chunks(max.max(1)) {
+        out.extend(f(chunk)?);
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::*;
+
+    #[test]
+    fn chunks_preserve_order_and_bound_size() {
+        let texts: Vec<String> = (0..70).map(|i| format!("t{i}")).collect();
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let mut sizes = Vec::new();
+        let out: Vec<String> = embed_in_chunks(&refs, MAX_EMBED_BATCH, |c| {
+            sizes.push(c.len());
+            Ok::<_, ()>(c.iter().map(|s| s.to_string()).collect())
+        })
+        .unwrap();
+        assert_eq!(out, texts, "order preserved");
+        assert_eq!(sizes, vec![32, 32, 6], "no chunk exceeds the cap");
+    }
+
+    #[test]
+    fn empty_and_zero_cap() {
+        let out: Vec<u8> = embed_in_chunks(&[], 0, |_| Ok::<_, ()>(vec![1])).unwrap();
+        assert!(out.is_empty());
+        let out: Vec<usize> =
+            embed_in_chunks(&["a", "b"], 0, |c| Ok::<_, ()>(vec![c.len()])).unwrap();
+        assert_eq!(out, vec![1, 1], "cap 0 behaves as 1");
+    }
+
+    #[test]
+    fn first_error_stops() {
+        let mut calls = 0;
+        let r: std::result::Result<Vec<u8>, &str> = embed_in_chunks(&["a"; 5], 2, |_| {
+            calls += 1;
+            if calls == 2 {
+                Err("boom")
+            } else {
+                Ok(vec![0, 0])
+            }
+        });
+        assert_eq!(r, Err("boom"));
+        assert_eq!(calls, 2);
+    }
+}
 pub use manifest::{ManifestFile, ModelManifest, Pooling};
 
 #[cfg(feature = "native")]

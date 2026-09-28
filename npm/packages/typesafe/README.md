@@ -93,6 +93,72 @@ typesafe --help
   labeled examples it falls back to a similarity score flagged
   `calibrated: false`; it is never reported as a probability it has not earned.
 
+## Known limitations
+
+From an independent evaluation (25–27 Sep 2026, bge-small-en-v1.5, native ONNX
+build); details and reproduction in the
+[Typed Decisions Lab](https://typesafe-lab-276367410975.europe-west2.run.app).
+
+- **`choice` does not read `instructions`.** Only the option criteria are
+  embedded, so changing "Which team should *own* this" to "*avoid* this" gives
+  the same answer. Put the intent into the option descriptions.
+- **Negation.** Embeddings barely separate a predicate from its negation: on one
+  urgent message, "needs a response soon" scored 0.84 and "does NOT need a
+  response soon" 0.81. Phrase predicates positively and add labelled examples.
+- **Untrained `noul` / `score`.** Without examples, urgency on the tickets
+  fixture is at chance (AUROC 0.51) and a Low/Medium/High severity question on
+  a fresh benchmark scored 33% exact. Train these questions before relying on
+  them.
+- **Out-of-scope inputs.** `abstain` ranks off-topic states well: on CLINC150
+  its AUROC is 0.90 with all 150 intents and 0.94–0.97 on 8-intent subsets. Its
+  values are small, though, and shrink as the option count grows (median 0.002
+  at 150 options) and after training, so a fixed threshold does not carry
+  across questions. An explicit `other` option caught 17% of off-topic states
+  with 24% false alarms. Treat `abstain` as a relative score and tune any
+  threshold per question.
+- **Calibration needs data.** `calibrated` stays `false` until the calibration
+  slice has 20 examples, which at the default split means about 100 labels per
+  question.
+**Out-of-scope scores.** `abstain` ranks off-topic inputs well: on CLINC150
+(bge-small, zero-shot) its AUROC for the 1,000 out-of-scope test utterances is
+0.90 with all 150 intents and 0.94–0.97 on 8-intent subsets. By default it is
+the abstain share of a (K+1)-way softmax, so its scale depends on the option
+count (median 0.002 at 150 options, 0.03 at 8) and, after training, on the
+fitted temperature (about 1e-8 after 8-shot training). To threshold it,
+pass `createTypesafe({ engine: { abstainMode: 'sigmoid' } })`: `abstain` is then
+`sigmoid` of the same out-of-scope logit, on a fixed 0–1 scale that does not
+depend on K or training. A threshold tuned on CLINC150's 150-intent validation
+split (0.336) then caught 78% of test out-of-scope items at 14% false alarms, and
+92–97% at 11–19% on 8-intent subsets. `choice`, `probabilities` and
+`confidence` are the same in both modes.
+### Off-topic inputs: a catch-all option
+
+Adding an option such as `other: 'Anything else'` to a `choice` question does
+little by default: its text is matched like any other option, and off-topic
+states still land on the nearest real option. Declare it as a catch-all
+instead:
+
+```ts
+const ts = createTypesafe({ engine: { catchAll: 'other', catchAllThreshold: 0.36 } });
+```
+
+The catch-all's own text is then ignored. Its probability is the out-of-scope
+score over the real options (distance to their nearest prototype, or the best
+`not_for` match), the real options share the rest, and `other` is chosen when
+its probability reaches the threshold.
+
+The threshold depends on the embedder and on how the options are worded, so
+tune it on a few labelled in-scope and off-topic examples for each question.
+Measured with bge-small, zero-shot:
+
+| Question | `other` as an ordinary option | Catch-all, tuned threshold |
+|---|---|---|
+| CLINC150, 150 intents (1,000 off-topic test utterances) | 1.5% caught, 0.1% false alarms | 77.8% caught, 14.4% false alarms (0.336, tuned on validation) |
+| Tickets, 8 departments (100 tickets, 106 off-topic states) | 25.5% caught, 0% false alarms | 85–96% caught, 6–8% false alarms (0.358–0.361, tuned on the other half) |
+
+A threshold does not carry between these two questions: CLINC150's 0.336
+flags 61% of real tickets.
+
 ## Jev compatibility
 
 `systemOne` accepts exactly Jev's `POST /v1/systemone` body
@@ -110,6 +176,14 @@ const jev = await ts.systemOne(
 
 The Jev `model` field is accepted for compatibility and ignored: the local
 engine selects its own model arm under the loop's governance (ADR-004).
+
+By default a `choice` question's `instructions` are not embedded: only the
+criteria shape the answer, so "which asset do they own" and "which asset do they
+avoid" score the same. `score` already folds its instructions into each legend
+bucket. To do the same for `choice`, pass
+`createTypesafe({ engine: { choiceInstructions: true } })`: each option's `what`,
+examples and `not_for` are then embedded as `"<instructions>. <text>"`. With
+empty instructions the answers are identical to the default.
 
 ## Train, eval, serve
 
@@ -133,12 +207,30 @@ when it does not.
 
 `createTypesafe()` defaults to the **`hash`** embedder: a deterministic
 bag-of-words test double that needs no weights and runs everywhere. Its answers
-are always reported `calibrated: false`. Production accuracy needs the ONNX
-embedder:
+are always reported `calibrated: false`, and on real text they carry no
+meaning (the quick start above returns near-even probabilities), so use it for
+tests and wiring only. Production accuracy needs the ONNX embedder:
 
 ```ts
 const ts = createTypesafe({ embedder: { kind: 'onnx', modelDir: './models/bge', manifest: './models/manifest.json' } });
 ```
+
+Creating an engine on the `hash` embedder emits one process warning
+(`TYPESAFE_HASH_EMBEDDER`) per process, so a quick start never silently ships
+test-double answers. Tests can pass `{ warnOnHashEmbedder: false }` to silence it.
+
+### Calibration with few labels
+
+`confidence` is calibrated (`calibrated: true`) once the held-out calibration
+slice reaches `minCalibration` (20) examples; with the default every-5th split
+that takes about 100 labels per question. Below that, pass
+`createTypesafe({ engine: { crossfitCalibration: true } })`: the temperature
+(or the `noul` Platt layer) is then fitted on 5-fold out-of-fold scores over all
+labels, so 20 labels in total are enough. The head that answers is unchanged,
+so choices and accuracy are identical. On CFPB product routing (11 classes,
+bge-small, 600 test complaints, 3 samples each) it cut ECE from 0.23 to 0.13
+with 66 labels and from 0.23 to 0.09 with 88; at 110 labels the held-out slice
+is large enough and both settings give the same answers.
 
 ## The self-optimization loop
 
@@ -152,6 +244,15 @@ negative log-likelihood: a proposal promotes when the accuracy test rejects, or
 when accuracy is non-inferior and the NLL (calibration) test rejects — and the
 receipt records which criterion carried it. The promise is "never worse on your
 frozen split, and every change explained", not "improves every hour".
+
+Receipts are chained with a fast 128-bit FNV-1a checksum by default. It catches
+accidental edits and corruption, but anyone who can edit the log can also
+recompute it. For an audit trail, pass `receipt_hash: 'sha256'` in the campaign
+spec: each receipt is then chained with SHA-256 (stored as `"sha256:<hex>"`),
+and publishing or signing the last hash makes every earlier receipt
+tamper-evident. Each stored hash names its algorithm, so existing FNV logs keep
+verifying, and `verify_chain_requiring(HashAlg::Sha256)` (Rust) rejects a log
+rewritten with the weaker hash.
 
 **Implemented and measured (2026-09-21):** `train` (bank-backed, append-only),
 `optimize` (the gate above), `export`/`import` of the example bank, and the
@@ -219,10 +320,14 @@ concurrency 4, latency includes the network round trip):
 | latency p50 / p95 (ms) | 184.8 / 233.0 | 178.5 / 215.6 |
 | ECE | 0.073 | 0.068 |
 
-Jev's `noul` urgency (61.3%) sits **below** a constant "not urgent" baseline of
-71.3% (107 of the 150 test tickets are not urgent, from `test_rows.baseline` in
-the same JSON), and its confidence is saturated (ECE 0.073) — the design reasons
-the abstain bucket and calibration layer exist (ADR-003).
+At a fixed 0.5 threshold, Jev's `noul` urgency (61.3%) sits **below** a
+constant "not urgent" baseline of 71.3% (107 of the 150 test tickets are not
+urgent, from `test_rows.baseline` in the same JSON). The replay stores only the
+thresholded booleans; an independent live re-run on the same test split
+(jev-1.13.0, 25 Sep 2026) kept Jev's continuous `noul`, which ranks urgency
+well (AUROC 0.94) and scores 91.3% with a threshold of 0.91 chosen on the
+validation split. So the gap is a thresholding choice rather than a ranking
+failure; report AUROC alongside accuracy for `noul`.
 
 **ruvector substrate (index + query)**, from
 `bench/ruvector-router-2026-09-21.json` (5,000 docs, 384-d, 250 test queries,
@@ -233,7 +338,9 @@ recall@10):
 | ruvector VectorDb (native) | 1.00 | 5.85 / 6.88 |
 | `@ruvector/router` 0.1.28 VectorDb | 0.032 | 0.05 / 0.07 |
 
-The core reuses `ruvector-router-core` directly (ADR-001). The native VectorDb
+ADR-001 plans for the core to reuse `ruvector-router-core`; the current core
+does not import it (retrieval uses its own prototype and probe heads), so it is
+not a dependency today. The native VectorDb
 returns exact neighbours; the `@ruvector/router` 0.1.28 kNN path returns
 neighbours only from the most recently inserted region (recall 0.032) — a
 documented defect in that file, called out here rather than papered over.

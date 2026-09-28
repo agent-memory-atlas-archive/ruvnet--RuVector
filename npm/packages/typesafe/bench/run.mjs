@@ -30,7 +30,7 @@ import { createRequire } from 'node:module';
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, isAbsolute } from 'node:path';
-import { loadTickets, assertDisjoint, excludeHeldOutText, majorityLabelFromTrain, verifyFixtureHashes, BENCH_DIR, FIXTURE_DIR } from './lib/fixture.mjs';
+import { loadTickets, assertDisjoint, excludeHeldOutText, majorityLabelFromTrain, verifyFixtureHashes, loadDerivedFixture, BENCH_DIR, FIXTURE_DIR } from './lib/fixture.mjs';
 import { assertVocabDisjoint } from './lib/vocab-guard.mjs';
 import { replayJev, runLocal, trainFewShot, trainTicketQuestions } from './lib/arms.mjs';
 import { scoreRecords, buildReceipt, readStats, toItemRecords, recordsDocument } from './lib/receipt.mjs';
@@ -181,6 +181,14 @@ async function runTickets(args, deps, ctx = {}) {
       // champion is informational only
       const champ = replayJev(jevBaseline, tickets.bySplit.test, { arm: 'champion', limit: args.limit });
       if (champ.available) metrics.jev_champion = { test: scoreRecords(champ.records, { departments }) };
+      // Independent live re-run (jev-1.13.0, 2026-09-25) that kept Jev's
+      // continuous noul, so urgent AUROC is reported for Jev as well as the
+      // 0.5-threshold accuracy. Informational, like the champion replay.
+      if (existsSync(join(benchDir, 'jev-live-2026-09-25.json'))) {
+        const liveCapture = loadDerivedFixture('jev-live-2026-09-25.json', { benchDir, fixtureDir });
+        const live = replayJev(liveCapture, tickets.bySplit.test, { arm: 'live', limit: args.limit });
+        if (live.available) metrics.jev_live = { test: scoreRecords(live.records, { departments }) };
+      }
     }
   }
 
@@ -454,7 +462,11 @@ function printSuite(suite, run, receipt, gateResult, args) {
   console.log('|---|---|---|---|---|---|');
   for (const r of rows) console.log(`| ${r.join(' | ')} |`);
   if (run.localUnavailable) console.log(`\n_local arm: engine unavailable — ${run.localUnavailable}_`);
-  if (run.metrics.jev) console.log(`_jev arm: replayed frozen baseline (gen-0); no network. Jev exposes no noul probability, so urgent AUROC is n/a for jev._`);
+  if (run.metrics.jev) console.log(`_jev arm: replayed frozen baseline (gen-0); no network. That capture kept only a 0.5-threshold urgent boolean, so urgent AUROC is n/a for it._`);
+  if (run.metrics.jev_live) {
+    const l = run.metrics.jev_live.test;
+    console.log(`_jev live re-run (jev-1.13.0, 2026-09-25, continuous noul kept): dept ${(l.choice_accuracy * 100).toFixed(1)}%, urgent ${(l.urgent_accuracy * 100).toFixed(1)}% at 0.5, urgent AUROC ${l.urgent_auroc?.toFixed(3) ?? 'n/a'}._`);
+  }
   if (gateResult) {
     console.log(`\n### Gates${args.reportOnly ? ' (report-only)' : ''}`);
     console.log(gatesTable(gateResult));

@@ -26,7 +26,7 @@ pub mod fit;
 pub mod optimize;
 pub mod options;
 
-pub use options::{EngineOptions, HeadChoice};
+pub use options::{AbstainMode, EngineOptions, HeadChoice};
 
 use fit::{Artifact, MIN_EXAMPLES_PER_CLASS};
 
@@ -37,6 +37,21 @@ use fit::{Artifact, MIN_EXAMPLES_PER_CLASS};
 // cached ONNX questions could otherwise retain hundreds of MB of vectors.
 const MAX_COMPILED_QUESTIONS: usize = 128;
 const MAX_FITTED_ARTIFACTS: usize = 128;
+
+/// The question type a `train` call is for, when the caller knows it.
+///
+/// `train` has no question definition (criteria arrive at `decide` time), so by
+/// default [`TrainReport::head`] is inferred from the label strings, and a
+/// `choice` question whose options look boolean (`yes`/`no`, `pos`/`neg`) was
+/// reported as `logistic` even though `decide` answers it with a class head.
+/// Passing the kind makes the report match what `decide` will use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QuestionKind {
+    Choice,
+    Score,
+    Noul,
+}
 
 /// Labeled example used by `train` (text, option key / legend bucket / "yes"|"no").
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -124,7 +139,7 @@ impl<E: Embedder> Engine<E> {
                     Slot::Cached(c.clone())
                 } else {
                     let start = texts.len();
-                    let t = question_texts(q);
+                    let t = question_texts(q, self.options.choice_instructions);
                     let len = t.len();
                     texts.extend(t);
                     Slot::Pending { start, len }
@@ -192,8 +207,27 @@ impl<E: Embedder> Engine<E> {
     /// Criteria arrive only at `decide` time, so a label that matches no
     /// criterion is simply ignored by the head then.
     pub fn train(&mut self, question: &str, examples: &[LabeledExample]) -> Result<TrainReport> {
-        let (accepted, rejected) = self.admit_rows(question, examples, None)?;
-        Ok(self.report(question, accepted, rejected))
+        self.train_typed(question, None, examples, &[])
+    }
+
+    /// [`train`](Self::train) / [`train_with_calibration`](Self::train_with_calibration)
+    /// with an optional [`QuestionKind`], so the reported head matches the one
+    /// `decide` will use. `kind: None` keeps the label-based inference; an
+    /// empty `calibration` means the plain `train` path.
+    pub fn train_typed(
+        &mut self,
+        question: &str,
+        kind: Option<QuestionKind>,
+        examples: &[LabeledExample],
+        calibration: &[LabeledExample],
+    ) -> Result<TrainReport> {
+        let (a1, r1) = self.admit_rows(question, examples, None)?;
+        let (a2, r2) = if calibration.is_empty() {
+            (0, 0)
+        } else {
+            self.admit_rows(question, calibration, Some(Split::Calibration))?
+        };
+        Ok(self.report(question, a1 + a2, r1 + r2, kind))
     }
 
     /// [`train`](Self::train) plus an explicit calibration slice (ADR-008 §4),
@@ -207,15 +241,21 @@ impl<E: Embedder> Engine<E> {
     ) -> Result<TrainReport> {
         let (a1, r1) = self.admit_rows(question, examples, None)?;
         let (a2, r2) = self.admit_rows(question, calibration, Some(Split::Calibration))?;
-        Ok(self.report(question, a1 + a2, r1 + r2))
+        Ok(self.report(question, a1 + a2, r1 + r2, None))
     }
 
-    fn report(&self, question: &str, accepted: usize, rejected: usize) -> TrainReport {
+    fn report(
+        &self,
+        question: &str,
+        accepted: usize,
+        rejected: usize,
+        kind: Option<QuestionKind>,
+    ) -> TrainReport {
         TrainReport {
             question: question.to_string(),
             accepted,
             rejected,
-            head: self.provisional_head(question),
+            head: self.provisional_head(question, kind),
             calibrated: self.provisional_calibrated(question),
         }
     }
@@ -431,7 +471,10 @@ impl<E: Embedder> Engine<E> {
     /// The head a `TrainReport` announces, from the bank's Train split for this
     /// question with the calibration positions excluded (matching the head
     /// `decide` will pick under the current options).
-    fn provisional_head(&self, question: &str) -> Head {
+    fn provisional_head(&self, question: &str, kind: Option<QuestionKind>) -> Head {
+        if kind == Some(QuestionKind::Noul) {
+            return Head::Logistic;
+        }
         let bank = self.bank.read().unwrap();
         let stride = effective_stride(&bank, question, self.options.calib_stride());
         let mut counts: BTreeMap<String, usize> = BTreeMap::new();
@@ -441,7 +484,11 @@ impl<E: Embedder> Engine<E> {
             }
             *counts.entry(e.label.clone()).or_insert(0) += 1;
         }
-        if !counts.is_empty() && counts.keys().all(|k| parse_noul_label(k).is_some()) {
+        // Without a kind, boolean-looking labels are taken to mean a `noul`.
+        if kind.is_none()
+            && !counts.is_empty()
+            && counts.keys().all(|k| parse_noul_label(k).is_some())
+        {
             return Head::Logistic;
         }
         let counts_vec: Vec<usize> = counts.values().copied().collect();
@@ -465,13 +512,19 @@ impl<E: Embedder> Engine<E> {
         }
         let bank = self.bank.read().unwrap();
         let explicit = bank.iter_split(question, Split::Calibration).count();
+        let train = bank.iter_split(question, Split::Train).count();
+        // Cross-fitting pools every label, so the slice size no longer gates it
+        // (provisional: a fold missing a class still falls back at fit time).
+        if self.options.crossfit_calibration
+            && train + explicit >= self.options.min_calibration.max(fit::CROSSFIT_FOLDS)
+        {
+            return true;
+        }
         if explicit > 0 {
             return explicit >= self.options.min_calibration;
         }
         let stride = self.options.calib_stride();
-        let calib = (0..bank.iter_split(question, Split::Train).count())
-            .filter(|&i| is_calib_pos(i, stride))
-            .count();
+        let calib = (0..train).filter(|&i| is_calib_pos(i, stride)).count();
         calib >= self.options.min_calibration
     }
 
