@@ -10,12 +10,23 @@
 use crate::model::{err_json, kge_error_json, KgeModel, SplitLabel};
 use ruvector_kge::scorer::{HolE, RotatE};
 use ruvector_kge::{
-    evaluate, AnnIndex, EvalConfig, ScorerKind, TieBreak, TrainConfig, Trainer, Triple, TripleStore,
+    evaluate, AnnIndex, DuplicateWeighting, EvalConfig, ScorerKind, TieBreak, TrainConfig, Trainer,
+    Triple, TripleStore,
 };
 use serde::Deserialize;
+use std::collections::HashMap;
 
 fn default_true() -> bool {
     true
+}
+
+/// Extra `train` options read from the same config JSON as [`TrainConfig`].
+#[derive(Deserialize, Default)]
+struct TrainExtras {
+    /// `"ignore"` (default), `"count"` or `"log"`: how facts added more than
+    /// once are weighted (training de-duplicates the store).
+    #[serde(default)]
+    duplicates: DuplicateWeighting,
 }
 
 #[derive(Deserialize)]
@@ -42,6 +53,10 @@ impl KgeModel {
             Err(e) => return err_json("invalid", &format!("train config parse error: {e}")),
         };
         cfg.dims = self.config.dims;
+        let extras: TrainExtras = match serde_json::from_str(config_json) {
+            Ok(x) => x,
+            Err(e) => return err_json("invalid", &format!("train config parse error: {e}")),
+        };
         if self.triples.is_empty() {
             return err_json("invalid", "no triples to train on");
         }
@@ -54,6 +69,12 @@ impl KgeModel {
         };
         if train_triples.is_empty() {
             return err_json("invalid", "no 'train'-labelled triples to train on");
+        }
+        let mut multiplicity: HashMap<Triple, u32> = HashMap::new();
+        if extras.duplicates != DuplicateWeighting::Ignore {
+            for t in &train_triples {
+                *multiplicity.entry(*t).or_insert(0) += 1;
+            }
         }
         let store = match TripleStore::new(train_triples) {
             Ok(s) => s,
@@ -72,11 +93,27 @@ impl KgeModel {
             };
             match kind {
                 ScorerKind::Hole => match HolE::new(dims) {
-                    Ok(sc) => Trainer::fit(tables, &sc, &store, &cfg, &mut record),
+                    Ok(sc) => Trainer::fit_with_multiplicity(
+                        tables,
+                        &sc,
+                        &store,
+                        &multiplicity,
+                        extras.duplicates,
+                        &cfg,
+                        &mut record,
+                    ),
                     Err(e) => Err(e),
                 },
                 ScorerKind::Rotate => match RotatE::new(dims) {
-                    Ok(sc) => Trainer::fit(tables, &sc, &store, &cfg, &mut record),
+                    Ok(sc) => Trainer::fit_with_multiplicity(
+                        tables,
+                        &sc,
+                        &store,
+                        &multiplicity,
+                        extras.duplicates,
+                        &cfg,
+                        &mut record,
+                    ),
                     Err(e) => Err(e),
                 },
             }

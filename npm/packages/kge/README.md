@@ -135,6 +135,10 @@ r.report.combined.mrr;
 ```
 
 - `train(config)` / `kge train` — mini-batch training over the tables (ADR-003).
+  Training de-duplicates the store; if you add the same fact several times to
+  record how often it occurs, pass `duplicates: 'count'` (train it once per
+  occurrence, capped at 1,000) or `'log'` (`1 + floor(ln n)` times). The
+  default, `'ignore'`, keeps the previous behaviour.
 - `evaluate(config)` / `kge eval` — filtered ranking metrics. **Split tags are
   honoured verbatim**: tag triples on ingest (`addTriples([{s,r,o,split:'test'}])`)
   and `train` uses only the `train` split while `eval({split:'test'})` scores

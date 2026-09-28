@@ -96,6 +96,21 @@ test('loadKge rejects a tampered envelope with KgeError{invalid}', { skip: !buil
   );
 });
 
+test('train accepts duplicates weighting and rejects unknown modes', { skip: !built && 'not built' }, async () => {
+  const { createKge, KgeError } = await load();
+  const kge = createKge({ scorer: 'hole', dims: 8, seed: 6 });
+  kge.addTriples([...FACTS, ...FACTS, FACTS[0]]);
+  for (const duplicates of ['ignore', 'count', 'log']) {
+    const report = await kge.train({ epochs: 1, lr: 0.1, duplicates });
+    assert.equal(typeof report.loss, 'number', `duplicates=${duplicates} trains`);
+  }
+  await assert.rejects(
+    () => kge.train({ epochs: 1, duplicates: 'sometimes' }),
+    (e) => e instanceof KgeError && e.kind === 'invalid',
+    'an unknown duplicates mode is a KgeError{invalid}',
+  );
+});
+
 test('train / evaluate / buildIndex / optimize all work', { skip: !built && 'not built' }, async () => {
   const { createKge, KgeError } = await load();
   const kge = createKge({ scorer: 'hole', dims: 8, seed: 4 });
