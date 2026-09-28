@@ -147,6 +147,15 @@ impl Trainer {
 
             for batch in order.chunks(config.batch_size) {
                 let mut grads = Grads::new(config.dims);
+                // Multilinear scorers (HolE) take the batched 1-vs-all path:
+                // one index-vector build per batch instead of 4·|E| score/grad
+                // calls per positive. Identical loss and gradients.
+                let mut batched =
+                    if matches!(config.loss, LossKind::OneVsAll) && scorer.multilinear() {
+                        Some(loss::BatchedOneVsAll::new(tables, scorer)?)
+                    } else {
+                        None
+                    };
                 for &i in batch {
                     let t = positives[i];
                     let data_loss = match config.loss {
@@ -164,13 +173,21 @@ impl Trainer {
                             &mut sample_rng,
                             &mut grads,
                         )?,
-                        LossKind::OneVsAll => loss::one_vs_all_step(tables, scorer, t, &mut grads)?,
+                        LossKind::OneVsAll => match batched.as_mut() {
+                            Some(b) => {
+                                loss::one_vs_all_step_batched(tables, scorer, t, b, &mut grads)?
+                            }
+                            None => loss::one_vs_all_step(tables, scorer, t, &mut grads)?,
+                        },
                     };
                     epoch_loss += data_loss as f64;
                     if config.n3_lambda > 0.0 {
                         epoch_n3 +=
                             apply_n3(tables, t, config.n3_lambda, &mut grads, &mut n3_buf)? as f64;
                     }
+                }
+                if let Some(b) = batched.as_mut() {
+                    b.flush(&mut grads);
                 }
                 if !grads.is_empty() {
                     opt.apply(tables, &grads)?;

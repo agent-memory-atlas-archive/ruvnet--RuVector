@@ -230,6 +230,124 @@ pub(crate) fn one_vs_all_step(
     Ok(loss)
 }
 
+/// Per-batch precomputation for [`one_vs_all_step_batched`]: every entity's
+/// index vector (row-major, `num_entities × index_dims`) plus a dense
+/// accumulator for the per-entity gradients of the batch.
+///
+/// Built once per mini-batch — the tables do not change inside a batch
+/// (the optimiser applies after it), so the index vectors stay valid.
+pub(crate) struct BatchedOneVsAll {
+    index: Vec<f32>,
+    index_dims: usize,
+    dense: Vec<f32>,
+    dims: usize,
+    logits: Vec<f32>,
+}
+
+impl BatchedOneVsAll {
+    pub(crate) fn new(tables: &Tables, scorer: &dyn Differentiable) -> Result<Self> {
+        let n = tables.num_entities();
+        let dd = scorer.index_dims();
+        let mut index = Vec::with_capacity(n * dd);
+        for e in 0..n as u32 {
+            index.extend_from_slice(&scorer.index_vector(tables.entity(e)?));
+        }
+        Ok(Self {
+            index,
+            index_dims: dd,
+            dense: vec![0.0; n * scorer.dims()],
+            dims: scorer.dims(),
+            logits: vec![0.0; n],
+        })
+    }
+
+    fn score_all(&mut self, q: &[f32]) {
+        for (e, lg) in self.logits.iter_mut().enumerate() {
+            let row = &self.index[e * self.index_dims..(e + 1) * self.index_dims];
+            *lg = row.iter().zip(q).map(|(a, b)| a * b).sum();
+        }
+    }
+
+    /// Move the accumulated per-entity gradients into `grads`.
+    pub(crate) fn flush(&mut self, grads: &mut Grads) {
+        let d = self.dims;
+        for (e, row) in self.dense.chunks(d).enumerate() {
+            if row.iter().any(|&x| x != 0.0) {
+                grads.add_entity(e as u32, row);
+            }
+        }
+        self.dense.iter_mut().for_each(|x| *x = 0.0);
+    }
+}
+
+/// Batched 1-vs-all cross-entropy for multilinear scorers
+/// ([`Differentiable::multilinear`]). Same loss and gradients as
+/// [`one_vs_all_step`], computed without a per-entity `score`/`grad` call:
+///
+/// - every entity is scored with one dot product against the precomputed
+///   index vectors (`query · index = score` exactly);
+/// - because the score is linear in the open slot, `Σ_e c_e ∇_{s,r} score(s,r,e)`
+///   equals `∇_{s,r} score(s, r, Σ_e c_e e)`, so the anchor/relation gradients
+///   need one `grad` call on the coefficient-weighted entity;
+/// - the open-slot gradient does not depend on the open entity, so entity `e`
+///   receives `c_e · g` for a single vector `g`.
+///
+/// Cost per positive: `O(|E|·d)` multiply-adds plus two `grad` calls, instead
+/// of `4·|E|` FFT-based score/grad calls.
+pub(crate) fn one_vs_all_step_batched(
+    tables: &Tables,
+    scorer: &dyn Differentiable,
+    t: Triple,
+    batch: &mut BatchedOneVsAll,
+    grads: &mut Grads,
+) -> Result<f32> {
+    let n = tables.num_entities();
+    let d = scorer.dims();
+    let s = tables.entity(t.s)?;
+    let r = tables.relation(t.r)?;
+    let o = tables.entity(t.o)?;
+    let mut loss = 0.0f32;
+
+    for side in [crate::Side::Tail, crate::Side::Head] {
+        let (anchor, anchor_id, gold) = match side {
+            crate::Side::Tail => (s, t.s, t.o),
+            crate::Side::Head => (o, t.o, t.s),
+        };
+        let q = scorer.query_vector(r, anchor, side);
+        batch.score_all(&q);
+        softmax_inplace(&mut batch.logits);
+        loss += -(batch.logits[gold as usize].max(1e-30)).ln();
+        // Coefficient-weighted open entity: Σ_e (p_e − 1{e = gold}) · E_e.
+        let mut weighted = vec![0.0f32; d];
+        for e in 0..n {
+            let c = batch.logits[e] - if e as u32 == gold { 1.0 } else { 0.0 };
+            if c != 0.0 {
+                axpy(&mut weighted, c, tables.entity(e as u32)?);
+            }
+        }
+        let (unit, g_rel, g_anchor) = match side {
+            crate::Side::Tail => {
+                let (gs, gr, go) = scorer.grad(s, r, &weighted);
+                (go, gr, gs)
+            }
+            crate::Side::Head => {
+                let (gs, gr, go) = scorer.grad(&weighted, r, o);
+                (gs, gr, go)
+            }
+        };
+        grads.add_entity(anchor_id, &g_anchor);
+        grads.add_relation(t.r, &g_rel);
+        // `unit` is ∂score/∂(open slot); it is the same for every open entity.
+        for e in 0..n {
+            let c = batch.logits[e] - if e as u32 == gold { 1.0 } else { 0.0 };
+            if c != 0.0 {
+                axpy(&mut batch.dense[e * d..(e + 1) * d], c, &unit);
+            }
+        }
+    }
+    Ok(loss)
+}
+
 /// Accumulate `coeff * grad(score)` into the three rows of a triple.
 #[allow(clippy::too_many_arguments)]
 fn accumulate_triple_grad(
@@ -259,5 +377,76 @@ fn scaled(a: f32, v: &[f32]) -> Vec<f32> {
 fn axpy(dst: &mut [f32], a: f32, v: &[f32]) {
     for (d, &x) in dst.iter_mut().zip(v) {
         *d += a * x;
+    }
+}
+
+#[cfg(test)]
+mod batched_tests {
+    use super::*;
+    use crate::scorer::HolE;
+    use crate::train::grad::testing::DistMult;
+    use crate::train::optim::Grads;
+
+    fn max_abs_diff(
+        a: &std::collections::BTreeMap<u32, Vec<f32>>,
+        b: &std::collections::BTreeMap<u32, Vec<f32>>,
+    ) -> f32 {
+        assert_eq!(
+            a.keys().collect::<Vec<_>>(),
+            b.keys().collect::<Vec<_>>(),
+            "same rows touched"
+        );
+        a.iter()
+            .flat_map(|(k, va)| va.iter().zip(&b[k]).map(|(x, y)| (x - y).abs()))
+            .fold(0.0, f32::max)
+    }
+
+    fn check(scorer: &dyn Differentiable, dims: usize) {
+        let (ne, nr) = (37, 4);
+        let tables = Tables::new(ne, nr, dims, 11);
+        let triples = [
+            Triple::new(0, 1, 5),
+            Triple::new(7, 0, 7),
+            Triple::new(36, 3, 2),
+            Triple::new(12, 2, 30),
+        ];
+        let mut exact = Grads::new(dims);
+        let mut fast = Grads::new(dims);
+        let mut batch = BatchedOneVsAll::new(&tables, scorer).unwrap();
+        let (mut l_exact, mut l_fast) = (0.0f32, 0.0f32);
+        for &t in &triples {
+            l_exact += one_vs_all_step(&tables, scorer, t, &mut exact).unwrap();
+            l_fast += one_vs_all_step_batched(&tables, scorer, t, &mut batch, &mut fast).unwrap();
+        }
+        batch.flush(&mut fast);
+        assert!(
+            (l_exact - l_fast).abs() < 1e-4 * l_exact.abs().max(1.0),
+            "loss {l_exact} vs {l_fast}"
+        );
+        let scale = exact
+            .entity_rows()
+            .values()
+            .flatten()
+            .fold(0.0f32, |m, x| m.max(x.abs()));
+        assert!(
+            scale > 1e-3,
+            "gradients are non-trivial (max |g| = {scale})"
+        );
+        let de = max_abs_diff(exact.entity_rows(), fast.entity_rows());
+        let dr = max_abs_diff(exact.relation_rows(), fast.relation_rows());
+        assert!(
+            de < 1e-4 * scale.max(1.0) && dr < 1e-4 * scale.max(1.0),
+            "entity diff {de}, relation diff {dr} (scale {scale})"
+        );
+    }
+
+    #[test]
+    fn batched_matches_exact_for_hole() {
+        check(&HolE::new(16).unwrap(), 16);
+    }
+
+    #[test]
+    fn batched_matches_exact_for_distmult() {
+        check(&DistMult::new(8), 8);
     }
 }
