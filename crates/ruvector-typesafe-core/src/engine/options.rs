@@ -20,6 +20,25 @@ pub enum HeadChoice {
     Probe,
 }
 
+/// How `meta.abstain` is reported for `choice` / `score` answers.
+///
+/// `Softmax` (default, original behaviour) reports the abstain logit's share of
+/// a (K+1)-way softmax with the option scores, after the fitted temperature. Its
+/// scale shrinks as the option count K grows, and after training a sharp fitted
+/// temperature pushes it towards zero, so one threshold does not carry across
+/// questions. `Sigmoid` reports `sigmoid(abstain_logit)`: the same
+/// out-of-scope signal (distance to the nearest prototype, or the best
+/// `not_for` match) on a fixed 0–1 scale that does not depend on K or on the
+/// head's temperature. `choice`, `probabilities` and `confidence` are identical
+/// in both modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AbstainMode {
+    #[default]
+    Softmax,
+    Sigmoid,
+}
+
 /// The engine's tunable parameters. Defaults reproduce the original constants:
 /// probe `lr=0.8, l2=1e-3, iters=400`; `not_for` λ = 0.5; abstain τ = 0.35,
 /// scale = 0.5; logit scale = 1.0 (no sharpening); calibration slice = 20 %
@@ -61,6 +80,8 @@ pub struct EngineOptions {
     /// its legend. Off by default (original behaviour: `choice` embeds only
     /// the criteria, so its instructions do not affect the answer).
     pub choice_instructions: bool,
+    /// How `meta.abstain` is reported (see [`AbstainMode`]). Default `Softmax`.
+    pub abstain_mode: AbstainMode,
 }
 
 impl Default for EngineOptions {
@@ -78,6 +99,7 @@ impl Default for EngineOptions {
             min_calibration: 20,
             head: HeadChoice::Auto,
             choice_instructions: false,
+            abstain_mode: AbstainMode::Softmax,
         }
     }
 }

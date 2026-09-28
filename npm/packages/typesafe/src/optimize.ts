@@ -39,6 +39,14 @@ export interface EngineTuning {
    * the criteria, so its instructions do not change the answer.
    */
   choiceInstructions?: boolean;
+  /**
+   * How `abstain` is reported. `'softmax'` (default) is the abstain share of a
+   * (K+1)-way softmax, which shrinks with the option count and after training.
+   * `'sigmoid'` reports the same out-of-scope signal on a fixed 0–1 scale, so
+   * one threshold carries across questions. Choices, probabilities and
+   * confidence are identical in both modes.
+   */
+  abstainMode?: 'softmax' | 'sigmoid';
 }
 
 /** One labeled campaign row with an explicit frozen split. */

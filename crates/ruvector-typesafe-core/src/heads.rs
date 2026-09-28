@@ -19,6 +19,7 @@ pub(crate) use probe::softmax;
 
 use crate::calibration::apply_temperature;
 use crate::embedder::{dot, l2_normalize};
+use crate::engine::AbstainMode;
 use crate::{Answer, AnswerMeta, Head, Question};
 use std::collections::BTreeMap;
 
@@ -232,10 +233,15 @@ pub(crate) struct Classified<'a> {
     pub logit_scale: f32,
     pub calibrated: bool,
     pub model: &'a str,
+    /// How the reported `abstain` is formed (see [`AbstainMode`]).
+    pub abstain_mode: AbstainMode,
 }
 
 impl Classified<'_> {
-    fn shares_and_abstain(&self) -> (Vec<f32>, f32) {
+    /// Returns `(shares, abstain_for_confidence, reported_abstain)`.
+    /// `confidence` always uses the (K+1)-softmax mass, so it is identical in
+    /// every mode; only the reported `abstain` changes under `Sigmoid`.
+    fn shares_and_abstain(&self) -> (Vec<f32>, f32, f32) {
         let s = self.logit_scale;
         let mut proto_full: Vec<f32> = self.proto_scores.iter().map(|l| l * s).collect();
         proto_full.push(self.abstain_logit * s);
@@ -243,7 +249,11 @@ impl Classified<'_> {
         let abstain = *proto_masses.last().unwrap_or(&0.0);
         let scaled: Vec<f32> = self.head_logits.iter().map(|l| l * s).collect();
         let shares = softmax(&apply_temperature(&scaled, self.temperature));
-        (shares, abstain)
+        let reported = match self.abstain_mode {
+            AbstainMode::Softmax => abstain,
+            AbstainMode::Sigmoid => sigmoid(self.abstain_logit),
+        };
+        (shares, abstain, reported)
     }
 
     fn meta(&self, confidence: f32, abstain: f32) -> AnswerMeta {
@@ -265,7 +275,7 @@ impl Classified<'_> {
     }
 
     fn make_choice(&self) -> Answer {
-        let (shares, abstain) = self.shares_and_abstain();
+        let (shares, abstain, reported) = self.shares_and_abstain();
         let best = argmax(&shares);
         let confidence = shares[best] * (1.0 - abstain);
         let probabilities: BTreeMap<String, f32> = self
@@ -277,12 +287,12 @@ impl Classified<'_> {
         Answer::Choice {
             choice: self.keys[best].clone(),
             probabilities,
-            meta: self.meta(confidence, abstain),
+            meta: self.meta(confidence, reported),
         }
     }
 
     fn make_score(&self) -> Answer {
-        let (shares, abstain) = self.shares_and_abstain();
+        let (shares, abstain, reported) = self.shares_and_abstain();
         let expected: f32 = shares.iter().enumerate().map(|(i, p)| i as f32 * p).sum();
         let score = (expected.round() as usize).min(self.keys.len() - 1);
         let confidence = shares[score] * (1.0 - abstain);
@@ -290,7 +300,7 @@ impl Classified<'_> {
             score,
             legend: self.keys[score].clone(),
             probabilities: shares,
-            meta: self.meta(confidence, abstain),
+            meta: self.meta(confidence, reported),
         }
     }
 }
@@ -324,6 +334,10 @@ pub(crate) fn argmax(v: &[f32]) -> usize {
         .fold(0, |best, (i, &x)| if x > v[best] { i } else { best })
 }
 
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,6 +357,7 @@ mod tests {
             logit_scale: 1.0,
             calibrated: false,
             model: "test",
+            abstain_mode: AbstainMode::Softmax,
         }
         .into_answer();
         let Answer::Score {
@@ -356,5 +371,91 @@ mod tests {
         };
         assert_eq!(score, 1, "rounded expected score differs from top class");
         assert!((meta.confidence - probabilities[score] * (1.0 - meta.abstain)).abs() < 1e-6);
+    }
+
+    fn classified_with<'a>(
+        keys: &'a [String],
+        protos: &'a [f32],
+        abstain_logit: f32,
+        temperature: f32,
+        mode: AbstainMode,
+    ) -> Answer {
+        Classified {
+            keys,
+            kind: ClassKind::Choice,
+            head_logits: protos.to_vec(),
+            proto_scores: protos,
+            abstain_logit,
+            head: Head::LinearProbe,
+            temperature,
+            logit_scale: 1.0,
+            calibrated: true,
+            model: "test",
+            abstain_mode: mode,
+        }
+        .into_answer()
+    }
+
+    fn meta_of(a: &Answer) -> &AnswerMeta {
+        match a {
+            Answer::Choice { meta, .. }
+            | Answer::Score { meta, .. }
+            | Answer::Noul { meta, .. } => meta,
+        }
+    }
+
+    #[test]
+    fn sigmoid_abstain_ignores_option_count_and_temperature() {
+        // Same nearest-prototype distance, 8 vs 150 options, T = 1 vs a sharp
+        // fitted T = 0.1: the sigmoid score is identical; the softmax mass is not.
+        let k8: Vec<String> = (0..8).map(|i| format!("o{i}")).collect();
+        let k150: Vec<String> = (0..150).map(|i| format!("o{i}")).collect();
+        let p8 = vec![0.6_f32; 8];
+        let p150 = vec![0.6_f32; 150];
+        let logit = (0.35 - 0.6) / 0.5;
+        let sig = |k: &[String], p: &[f32], t| {
+            meta_of(&classified_with(k, p, logit, t, AbstainMode::Sigmoid)).abstain
+        };
+        let soft = |k: &[String], p: &[f32], t| {
+            meta_of(&classified_with(k, p, logit, t, AbstainMode::Softmax)).abstain
+        };
+        let expected = 1.0 / (1.0 + (-logit).exp());
+        for v in [
+            sig(&k8, &p8, 1.0),
+            sig(&k150, &p150, 1.0),
+            sig(&k150, &p150, 0.1),
+        ] {
+            assert!((v - expected).abs() < 1e-6);
+        }
+        assert!(soft(&k150, &p150, 1.0) < soft(&k8, &p8, 1.0));
+        assert!(soft(&k150, &p150, 0.1) < 1e-3);
+    }
+
+    #[test]
+    fn sigmoid_mode_leaves_choice_and_confidence_unchanged() {
+        let keys: Vec<String> = vec!["a".into(), "b".into(), "c".into()];
+        let protos = vec![0.7_f32, 0.4, 0.2];
+        let a = classified_with(&keys, &protos, -0.7, 0.5, AbstainMode::Softmax);
+        let b = classified_with(&keys, &protos, -0.7, 0.5, AbstainMode::Sigmoid);
+        match (&a, &b) {
+            (
+                Answer::Choice {
+                    choice: ca,
+                    probabilities: pa,
+                    meta: ma,
+                },
+                Answer::Choice {
+                    choice: cb,
+                    probabilities: pb,
+                    meta: mb,
+                },
+            ) => {
+                assert_eq!(ca, cb);
+                assert_eq!(pa, pb);
+                assert_eq!(ma.confidence, mb.confidence);
+                assert_ne!(ma.abstain, mb.abstain);
+            }
+            _ => panic!("expected choice answers"),
+        }
     }
 }

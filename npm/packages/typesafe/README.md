@@ -119,6 +119,18 @@ build); details and reproduction in the
 - **Calibration needs data.** `calibrated` stays `false` until the calibration
   slice has 20 examples, which at the default split means about 100 labels per
   question.
+**Out-of-scope scores.** `abstain` ranks off-topic inputs well: on CLINC150
+(bge-small, zero-shot) its AUROC for the 1,000 out-of-scope test utterances is
+0.90 with all 150 intents and 0.94–0.97 on 8-intent subsets. By default it is
+the abstain share of a (K+1)-way softmax, so its scale depends on the option
+count (median 0.002 at 150 options, 0.03 at 8) and, after training, on the
+fitted temperature (about 1e-8 after 8-shot training). To threshold it,
+pass `createTypesafe({ engine: { abstainMode: 'sigmoid' } })`: `abstain` is then
+`sigmoid` of the same out-of-scope logit, on a fixed 0–1 scale that does not
+depend on K or training. A threshold tuned on CLINC150's 150-intent validation
+split (0.336) then caught 78% of test out-of-scope items at 14% false alarms, and
+92–97% at 11–19% on 8-intent subsets. `choice`, `probabilities` and
+`confidence` are the same in both modes.
 
 ## Jev compatibility
 

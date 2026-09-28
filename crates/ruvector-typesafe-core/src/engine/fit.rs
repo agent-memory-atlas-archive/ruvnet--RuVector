@@ -206,6 +206,7 @@ pub(crate) fn class_answer(
         logit_scale: opts.logit_scale,
         calibrated: *calibrated,
         model,
+        abstain_mode: opts.abstain_mode,
     }
     .into_answer()
 }

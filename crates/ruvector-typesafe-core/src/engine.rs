@@ -26,7 +26,7 @@ pub mod fit;
 pub mod optimize;
 pub mod options;
 
-pub use options::{EngineOptions, HeadChoice};
+pub use options::{AbstainMode, EngineOptions, HeadChoice};
 
 use fit::{Artifact, MIN_EXAMPLES_PER_CLASS};
 
