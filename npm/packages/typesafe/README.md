@@ -218,6 +218,15 @@ when accuracy is non-inferior and the NLL (calibration) test rejects — and the
 receipt records which criterion carried it. The promise is "never worse on your
 frozen split, and every change explained", not "improves every hour".
 
+Receipts are chained with a fast 128-bit FNV-1a checksum by default. It catches
+accidental edits and corruption, but anyone who can edit the log can also
+recompute it. For an audit trail, pass `receipt_hash: 'sha256'` in the campaign
+spec: each receipt is then chained with SHA-256 (stored as `"sha256:<hex>"`),
+and publishing or signing the last hash makes every earlier receipt
+tamper-evident. Each stored hash names its algorithm, so existing FNV logs keep
+verifying, and `verify_chain_requiring(HashAlg::Sha256)` (Rust) rejects a log
+rewritten with the weaker hash.
+
 **Implemented and measured (2026-09-21):** `train` (bank-backed, append-only),
 `optimize` (the gate above), `export`/`import` of the example bank, and the
 `typesafe optimize` CLI. `Engine::optimize` / `ts.optimize` run a campaign over
