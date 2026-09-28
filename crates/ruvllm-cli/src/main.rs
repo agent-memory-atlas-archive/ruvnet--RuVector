@@ -109,6 +109,16 @@ enum Commands {
         /// Quantization format
         #[arg(short, long, default_value = "q4k")]
         quantization: String,
+
+        /// Exit with an error if the model fails to load, instead of serving
+        /// placeholder "mock mode" completions.
+        #[arg(
+            long,
+            env = "RUVLLM_STRICT",
+            action = clap::ArgAction::SetTrue,
+            value_parser = clap::builder::FalseyValueParser::new()
+        )]
+        strict: bool,
     },
 
     /// Interactive chat mode
@@ -276,6 +286,7 @@ async fn main() -> anyhow::Result<()> {
             max_concurrent,
             max_context,
             quantization,
+            strict,
         } => {
             serve::run(
                 &model,
@@ -285,6 +296,7 @@ async fn main() -> anyhow::Result<()> {
                 max_context,
                 &quantization,
                 &cache_dir,
+                strict,
             )
             .await
         }
