@@ -89,6 +89,18 @@ pub struct EngineOptions {
     /// in the slice (about 5× fewer by default). Off by default (original
     /// behaviour); the served head is unchanged, only its calibration layer.
     pub crossfit_calibration: bool,
+    /// Key of a catch-all option (e.g. `"other"`) in `choice` questions. Off
+    /// by default (`None`: every option, including one named "other", is an
+    /// ordinary option). When set and the question has that key, the option's
+    /// own text is not scored; its probability is `sigmoid` of the
+    /// out-of-scope logit over the other options (distance to their nearest
+    /// prototype, or the best `not_for` match), and it is chosen when that
+    /// probability reaches `catch_all_threshold`.
+    pub catch_all: Option<String>,
+    /// Probability at which the catch-all option is chosen. Tune it on
+    /// labelled in-scope and off-topic examples; the useful range depends on
+    /// the embedder (about 0.34 for bge-small with the default τ and scale).
+    pub catch_all_threshold: f32,
 }
 
 impl Default for EngineOptions {
@@ -108,6 +120,8 @@ impl Default for EngineOptions {
             choice_instructions: false,
             abstain_mode: AbstainMode::Softmax,
             crossfit_calibration: false,
+            catch_all: None,
+            catch_all_threshold: 0.5,
         }
     }
 }

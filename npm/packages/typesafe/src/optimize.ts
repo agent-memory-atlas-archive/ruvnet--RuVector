@@ -53,6 +53,15 @@ export interface EngineTuning {
    * instead of leaving answers uncalibrated. Off by default.
    */
   crossfitCalibration?: boolean;
+  /**
+   * Key of a catch-all option (e.g. `'other'`) in `choice` questions. Off by
+   * default. When set, that option's text is not matched; its probability is
+   * the out-of-scope score over the other options, and it is chosen at
+   * `catchAllThreshold`.
+   */
+  catchAll?: string;
+  /** Probability at which the catch-all is chosen (default 0.5). Tune per question. */
+  catchAllThreshold?: number;
 }
 
 /** One labeled campaign row with an explicit frozen split. */

@@ -12,7 +12,10 @@ use crate::calibration::{fit_temperature, Platt};
 use crate::engine::options::{EngineOptions, HeadChoice};
 use crate::heads::logistic::{BinaryLogistic, LogisticConfig};
 use crate::heads::probe::{MultiProbe, ProbeConfig};
-use crate::heads::{assemble_noul, geometry, similarity_to_unit, ClassProtos, Classified};
+use crate::heads::{
+    apply_catch_all, assemble_noul, geometry, oos_logit_excluding, similarity_to_unit, ClassProtos,
+    Classified,
+};
 use crate::{Answer, Head};
 
 /// Fewest examples of a class (in the training slice) before the linear probe
@@ -302,12 +305,20 @@ pub(crate) fn class_answer(
     else {
         unreachable!("class_answer called with a noul artifact");
     };
-    let g = geometry(state_emb, cp, opts.not_for_lambda);
-    let head_logits = match probe {
+    let mut g = geometry(state_emb, cp, opts.not_for_lambda);
+    let mut head_logits = match probe {
         Some(p) => p.logits(state_emb),
         None => g.proto_scores.clone(),
     };
-    Classified {
+    // Opt-in catch-all option (EngineOptions::catch_all): its text is never
+    // scored as a prototype or probe class; its probability comes from the
+    // out-of-scope logit over the real options.
+    let catch = catch_all_index(opts, cp);
+    if let Some(k) = catch {
+        head_logits[k] = f32::NEG_INFINITY;
+        g.proto_scores[k] = f32::NEG_INFINITY;
+    }
+    let answer = Classified {
         keys: &cp.keys,
         kind: cp.kind,
         head_logits,
@@ -320,7 +331,25 @@ pub(crate) fn class_answer(
         model,
         abstain_mode: opts.abstain_mode,
     }
-    .into_answer()
+    .into_answer();
+    match catch {
+        Some(k) => {
+            let z = oos_logit_excluding(state_emb, cp, k, opts.abstain_tau, opts.abstain_scale);
+            let p_oos = 1.0 / (1.0 + (-z).exp());
+            apply_catch_all(answer, k, &cp.keys, p_oos, opts.catch_all_threshold)
+        }
+        None => answer,
+    }
+}
+
+/// Index of the configured catch-all option, when this is a `choice` question
+/// that has it and at least two real options besides it.
+fn catch_all_index(opts: &EngineOptions, cp: &ClassProtos) -> Option<usize> {
+    let key = opts.catch_all.as_deref()?;
+    if !matches!(cp.kind, crate::heads::ClassKind::Choice) || cp.keys.len() < 3 {
+        return None;
+    }
+    cp.keys.iter().position(|k| k == key)
 }
 
 /// Score a `noul` state embedding into an answer under `opts`.

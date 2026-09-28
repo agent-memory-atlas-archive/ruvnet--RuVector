@@ -131,6 +131,33 @@ depend on K or training. A threshold tuned on CLINC150's 150-intent validation
 split (0.336) then caught 78% of test out-of-scope items at 14% false alarms, and
 92–97% at 11–19% on 8-intent subsets. `choice`, `probabilities` and
 `confidence` are the same in both modes.
+### Off-topic inputs: a catch-all option
+
+Adding an option such as `other: 'Anything else'` to a `choice` question does
+little by default: its text is matched like any other option, and off-topic
+states still land on the nearest real option. Declare it as a catch-all
+instead:
+
+```ts
+const ts = createTypesafe({ engine: { catchAll: 'other', catchAllThreshold: 0.36 } });
+```
+
+The catch-all's own text is then ignored. Its probability is the out-of-scope
+score over the real options (distance to their nearest prototype, or the best
+`not_for` match), the real options share the rest, and `other` is chosen when
+its probability reaches the threshold.
+
+The threshold depends on the embedder and on how the options are worded, so
+tune it on a few labelled in-scope and off-topic examples for each question.
+Measured with bge-small, zero-shot:
+
+| Question | `other` as an ordinary option | Catch-all, tuned threshold |
+|---|---|---|
+| CLINC150, 150 intents (1,000 off-topic test utterances) | 1.5% caught, 0.1% false alarms | 77.8% caught, 14.4% false alarms (0.336, tuned on validation) |
+| Tickets, 8 departments (100 tickets, 106 off-topic states) | 25.5% caught, 0% false alarms | 85–96% caught, 6–8% false alarms (0.358–0.361, tuned on the other half) |
+
+A threshold does not carry between these two questions: CLINC150's 0.336
+flags 61% of real tickets.
 
 ## Jev compatibility
 
