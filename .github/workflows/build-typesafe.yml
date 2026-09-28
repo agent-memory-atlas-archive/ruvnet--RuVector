@@ -463,6 +463,22 @@ jobs:
 
           echo "all five platform packages handled"
 
+      - name: Setup Rust (wasm32) for the WASM fallback
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Build the WASM fallback bundled in the meta package
+        shell: bash
+        run: |
+          bash npm/packages/typesafe/scripts/build-wasm.sh
+          # wasm-pack writes a '*' .gitignore that would drop the build from the tarball
+          rm -f npm/packages/typesafe/wasm/.gitignore npm/packages/typesafe/wasm/bundler/.gitignore
+
       - name: Publish the meta package (only after all five platforms verified)
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -511,7 +527,7 @@ jobs:
             npm publish --access public --dry-run --ignore-scripts 2>&1 | tee "$RUNNER_TEMP/pack.txt"
             dylibs=(native/libonnxruntime*.dylib)
             test "${#dylibs[@]}" -eq 1 && test -f "${dylibs[0]}"
-            for f in dist/index.js native/linux-x64-gnu/typesafe.linux-x64-gnu.node native/linux-x64-gnu/libonnxruntime.so.1 native/linux-x64-gnu/libonnxruntime_providers_shared.so native/linux-arm64-gnu/typesafe.linux-arm64-gnu.node native/linux-arm64-gnu/libonnxruntime.so.1 native/linux-arm64-gnu/libonnxruntime_providers_shared.so native/typesafe.darwin-x64.node "${dylibs[0]}" native/typesafe.darwin-arm64.node native/typesafe.win32-x64-msvc.node; do
+            for f in dist/index.js wasm/ruvector_typesafe_wasm_bg.wasm native/linux-x64-gnu/typesafe.linux-x64-gnu.node native/linux-x64-gnu/libonnxruntime.so.1 native/linux-x64-gnu/libonnxruntime_providers_shared.so native/linux-arm64-gnu/typesafe.linux-arm64-gnu.node native/linux-arm64-gnu/libonnxruntime.so.1 native/linux-arm64-gnu/libonnxruntime_providers_shared.so native/typesafe.darwin-x64.node "${dylibs[0]}" native/typesafe.darwin-arm64.node native/typesafe.win32-x64-msvc.node; do
               if ! grep -q "$f" "$RUNNER_TEMP/pack.txt"; then
                 echo "::error::dry-run tarball is missing $f"
                 exit 1
