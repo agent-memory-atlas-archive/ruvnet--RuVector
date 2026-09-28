@@ -20,9 +20,9 @@ const indexPath = join(pkgDir, 'index.js');
 
 // Cargo workspace version from the root Cargo.toml [workspace.package].
 // The binding reports its crate's CARGO_PKG_VERSION: a per-crate `version = "x"`
-// override in crates/ruvector--ffi/Cargo.toml, else the [workspace.package] one.
+// override in crates/ruvector-typesafe-ffi/Cargo.toml, else the [workspace.package] one.
 function workspaceVersion() {
-  const crate = readFileSync(join(repoRoot, 'crates', 'ruvector--ffi', 'Cargo.toml'), 'utf8');
+  const crate = readFileSync(join(repoRoot, 'crates', 'ruvector-typesafe-ffi', 'Cargo.toml'), 'utf8');
   const own = crate.slice(crate.indexOf('[package]')).match(/^version\s*=\s*"([^"]+)"/m);
   if (own) return own[1];
   const toml = readFileSync(join(repoRoot, 'Cargo.toml'), 'utf8');
