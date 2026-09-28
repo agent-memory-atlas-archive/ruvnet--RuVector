@@ -150,6 +150,13 @@ export function loadKge<R extends string = string>(
   opts: { binding?: Binding; schema?: Schema<R> } = {},
 ): Kge<R> {
   const binding = requireBinding(opts.binding);
-  const model = binding.Model.fromJson(modelJson);
+  let model: ModelInstance;
+  try {
+    model = binding.Model.fromJson(modelJson);
+  } catch (e) {
+    // The native/WASM loader throws a plain Error for a malformed or tampered
+    // envelope; surface it as a typed KgeError like every other rejection.
+    throw new KgeError(e instanceof Error ? e.message : String(e), 'invalid');
+  }
   return wrap<R>(binding, model);
 }

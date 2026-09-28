@@ -83,6 +83,19 @@ test('save / loadKge round-trips', { skip: !built && 'not built' }, async () => 
   assert.deepEqual(b.candidates, a.candidates, 'predictions match after reload');
 });
 
+test('loadKge rejects a tampered envelope with KgeError{invalid}', { skip: !built && 'not built' }, async () => {
+  const { createKge, loadKge, KgeError } = await load();
+  const kge = createKge({ scorer: 'hole', dims: 8, seed: 3 });
+  kge.addTriples(FACTS);
+  const env = JSON.parse(kge.save());
+  env.model.config.seed = (env.model.config.seed ?? 0) + 1; // any payload change breaks the sha256
+  assert.throws(
+    () => loadKge(JSON.stringify(env)),
+    (e) => e instanceof KgeError && e.kind === 'invalid',
+    'a tampered model throws KgeError{invalid}',
+  );
+});
+
 test('train / evaluate / buildIndex / optimize all work', { skip: !built && 'not built' }, async () => {
   const { createKge, KgeError } = await load();
   const kge = createKge({ scorer: 'hole', dims: 8, seed: 4 });

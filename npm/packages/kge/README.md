@@ -26,9 +26,10 @@ arXiv:1902.10197), the one family member that represents relation
 
 ## Status (v1)
 
-- **No platform packages yet.** The first release ships the WASM fallback and
-  builds the native addon locally; the five `optionalDependencies` platform
-  packages are added in a later bump PR (ADR-001 §5).
+- **Platforms.** 0.1.0 bundles the native addon for `linux-x64-gnu` plus the
+  WASM fallback; other platforms use WASM until the five `optionalDependencies`
+  platform packages are added in a later bump PR (ADR-001 §5).
+  `KGE_BACKEND=wasm` forces the fallback.
 - **`predict`, `similarRelations`, `compose`, `train`, `eval`, `buildIndex` and
   `optimize` all work today.** `predict` is exhaustive until you `buildIndex`,
   then ANN-accelerated. Before `train`, the tables are the deterministic seed
@@ -94,7 +95,8 @@ const restored = loadKge(saved);
 
 Errors are thrown as `KgeError` with a `.kind` in
 `limit | invalid | unavailable | unsupported | scorer`; success payloads never
-throw.
+throw. A malformed or tampered `save()` envelope makes `loadKge` throw
+`KgeError{kind:'invalid'}`.
 
 ## Quick start (CLI)
 
@@ -118,9 +120,10 @@ method, path, status and milliseconds only — never the request body.
 | `similarRelations` | `{r, k}` | `{relations:[{relation,score}]}` |
 | `compose` | `{r1, r2, s, k}` (RotatE) | `{candidates:[{entity,score}], exact, ann}` |
 
-`exact:true, ann:false` marks the exhaustive path; the
-`DistanceMetric::DotProduct` HNSW path (ADR-001 §3) flips these once the ANN
-index build lands.
+`exact:true, ann:false` marks the exhaustive path. After `buildIndex()`,
+`predict` uses the `DistanceMetric::DotProduct` HNSW path (ADR-001 §3) and
+returns `exact:false, ann:true`; pass `useIndex:false` to force exhaustive
+scoring.
 
 ## Training, evaluation, optimization
 
@@ -185,6 +188,28 @@ wasm32 — holds.
 Link-prediction quality (filtered MRR / Hits@k on FB15k-237, WN18RR, CoDEx-M),
 ANN recall, and latency are **to be measured by `kge bench`** (ADR-006); no
 numbers are quoted here until that harness writes them.
+
+## Release-gate status (0.1.0)
+
+From the committed receipts in `bench/results/` (21 Sep 2026). ADR-006 gates
+that have not yet been run at full scale are listed as such rather than implied.
+
+| Gate (ADR-006) | Status |
+|---|---|
+| Link prediction, FB15k-237 / WN18RR (MRR ≥ LibKGE ComplEx − 3 pts) | Not yet run on the full datasets; the committed FB15k-237 receipt is a 493-entity subgraph (test MRR 0.50) |
+| ANN recall@10 ≥ 0.90 | Pass on the synthetic suite (0.985) and the FB15k-237 subgraph (0.988) |
+| Adversarial confidence drop > 0 | Open: on the synthetic suite, confidence rose slightly under the symmetry-decoy attack (drop −0.059) |
+| Predict p95 latency (native) | Pass |
+| Tie-break, HolE≡ComplEx, loop safety | Not exercised by the committed receipts (HolE≡ComplEx is covered by the crate unit test) |
+
+## Notes
+
+- **Duplicate facts.** `addTriples` stores every triple it is given (and counts
+  them in `added`), but training builds a de-duplicated `TripleStore`, so
+  repeating a fact does not weight it.
+- **Regularisation.** The trainer's default N3 weight is `1e-3`. For
+  ComplEx-style models a larger weight (e.g. `n3_lambda: 0.05` in `train`)
+  often scores better; tune it on your validation split.
 
 ## Design records
 
