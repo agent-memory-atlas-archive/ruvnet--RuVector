@@ -82,6 +82,13 @@ pub struct EngineOptions {
     pub choice_instructions: bool,
     /// How `meta.abstain` is reported (see [`AbstainMode`]). Default `Softmax`.
     pub abstain_mode: AbstainMode,
+    /// When the held-out calibration slice is below `min_calibration`, fit the
+    /// temperature (class heads) or Platt layer (`noul`) on 5-fold out-of-fold
+    /// scores over train ∪ calibration instead of leaving the answer
+    /// uncalibrated. Needs only `min_calibration` labels in total rather than
+    /// in the slice (about 5× fewer by default). Off by default (original
+    /// behaviour); the served head is unchanged, only its calibration layer.
+    pub crossfit_calibration: bool,
 }
 
 impl Default for EngineOptions {
@@ -100,6 +107,7 @@ impl Default for EngineOptions {
             head: HeadChoice::Auto,
             choice_instructions: false,
             abstain_mode: AbstainMode::Softmax,
+            crossfit_calibration: false,
         }
     }
 }

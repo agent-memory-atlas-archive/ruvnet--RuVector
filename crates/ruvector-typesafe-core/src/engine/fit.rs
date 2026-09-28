@@ -120,6 +120,11 @@ pub(crate) fn fit_class_artifact(
             labels.push(*ci);
         }
         (fit_temperature(&logits, &labels), true)
+    } else if opts.crossfit_calibration && allow_calibration {
+        match crossfit_class_logits(opts, cp, train_ex, calib, dims, probe.is_some()) {
+            Some((logits, labels)) => (fit_temperature(&logits, &labels), true),
+            None => (1.0, false),
+        }
     } else {
         (1.0, false)
     };
@@ -160,6 +165,11 @@ pub(crate) fn fit_noul_artifact(
         let scores: Vec<f32> = calib.iter().map(|(x, _)| model.raw(x)).collect();
         let labels: Vec<f32> = calib.iter().map(|(_, y)| *y).collect();
         (Some(Platt::fit(&scores, &labels)), true)
+    } else if opts.crossfit_calibration && allow_calibration {
+        match crossfit_noul_scores(train_ex, calib, dims, &cfg, opts.min_calibration) {
+            Some((scores, labels)) => (Some(Platt::fit(&scores, &labels)), true),
+            None => (None, false),
+        }
     } else {
         (None, false)
     };
@@ -169,6 +179,108 @@ pub(crate) fn fit_noul_artifact(
         calibrated,
         head: Head::Logistic,
     }
+}
+
+/// Folds for cross-fitted calibration (`EngineOptions::crossfit_calibration`).
+pub(crate) const CROSSFIT_FOLDS: usize = 5;
+
+/// Out-of-fold, scale-multiplied class logits over `train ∪ calib`, for fitting
+/// a temperature when the calibration slice alone is below `min_calibration`.
+/// Each example is scored by a head trained without it (positional folds, so
+/// the result is deterministic). The final artifact's head is still the one
+/// trained on `train`; these logits only set its temperature. Returns `None`
+/// when the pool is below `min_calibration` or a fold cannot train the head
+/// the final artifact uses.
+fn crossfit_class_logits(
+    opts: &EngineOptions,
+    cp: &ClassProtos,
+    train_ex: &[(Vec<f32>, usize)],
+    calib: &[(Vec<f32>, usize)],
+    dims: usize,
+    with_probe: bool,
+) -> Option<(Vec<Vec<f32>>, Vec<usize>)> {
+    let pool: Vec<&(Vec<f32>, usize)> = train_ex.iter().chain(calib).collect();
+    if pool.len() < opts.min_calibration.max(CROSSFIT_FOLDS) {
+        return None;
+    }
+    let k = cp.keys.len();
+    let scale = opts.logit_scale;
+    let mut logits = Vec::with_capacity(pool.len());
+    let mut labels = Vec::with_capacity(pool.len());
+    for fold in 0..CROSSFIT_FOLDS {
+        let probe = if with_probe {
+            let fit: Vec<(Vec<f32>, usize)> = pool
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| i % CROSSFIT_FOLDS != fold)
+                .map(|(_, e)| (*e).clone())
+                .collect();
+            let mut counts = vec![0usize; k];
+            for (_, ci) in &fit {
+                if *ci < k {
+                    counts[*ci] += 1;
+                }
+            }
+            if k < 2 || counts.contains(&0) {
+                return None;
+            }
+            Some(MultiProbe::train(&fit, k, dims, &probe_config(opts)))
+        } else {
+            None
+        };
+        for (_, (emb, ci)) in pool
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % CROSSFIT_FOLDS == fold)
+        {
+            let row = match &probe {
+                Some(p) => p.logits(emb),
+                None => geometry(emb, cp, opts.not_for_lambda).proto_scores,
+            };
+            logits.push(row.iter().map(|l| l * scale).collect());
+            labels.push(*ci);
+        }
+    }
+    Some((logits, labels))
+}
+
+/// Out-of-fold raw logistic scores over `train ∪ calib` for a Platt layer, as
+/// [`crossfit_class_logits`] does for the class head. `None` when the pool is
+/// too small or a fold lacks a positive or a negative example.
+fn crossfit_noul_scores(
+    train_ex: &[(Vec<f32>, f32)],
+    calib: &[(Vec<f32>, f32)],
+    dims: usize,
+    cfg: &LogisticConfig,
+    min_calibration: usize,
+) -> Option<(Vec<f32>, Vec<f32>)> {
+    let pool: Vec<&(Vec<f32>, f32)> = train_ex.iter().chain(calib).collect();
+    if pool.len() < min_calibration.max(CROSSFIT_FOLDS) {
+        return None;
+    }
+    let mut scores = Vec::with_capacity(pool.len());
+    let mut labels = Vec::with_capacity(pool.len());
+    for fold in 0..CROSSFIT_FOLDS {
+        let fit: Vec<(Vec<f32>, f32)> = pool
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % CROSSFIT_FOLDS != fold)
+            .map(|(_, e)| (*e).clone())
+            .collect();
+        if !fit.iter().any(|(_, y)| *y >= 0.5) || !fit.iter().any(|(_, y)| *y < 0.5) {
+            return None;
+        }
+        let model = BinaryLogistic::train(&fit, dims, cfg);
+        for (_, (x, y)) in pool
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % CROSSFIT_FOLDS == fold)
+        {
+            scores.push(model.raw(x));
+            labels.push(*y);
+        }
+    }
+    Some((scores, labels))
 }
 
 /// Score a `choice`/`score` state embedding into a Jev-shaped answer under
