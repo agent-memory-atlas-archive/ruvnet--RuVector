@@ -52,15 +52,32 @@ pub(crate) enum Compiled {
 /// The texts a question needs embedded, in a fixed order that
 /// [`build_compiled`] consumes identically. Keeping the two in lock-step lets
 /// the engine batch every question's texts into one `embed` call.
-pub(crate) fn question_texts(q: &Question) -> Vec<String> {
+///
+/// `choice_instructions` (off by default, see
+/// [`EngineOptions::choice_instructions`](crate::EngineOptions)) prefixes a
+/// `choice` question's `instructions` to each option text, exactly as `score`
+/// already does for its legend. Off, `choice` embeds only the criteria, so its
+/// instructions do not change the answer.
+pub(crate) fn question_texts(q: &Question, choice_instructions: bool) -> Vec<String> {
     match q {
-        Question::Choice { criteria, .. } => {
+        Question::Choice {
+            instructions,
+            criteria,
+        } => {
+            let prefix = choice_instructions && !instructions.trim().is_empty();
+            let text = |t: &str| {
+                if prefix {
+                    bucket_text(instructions, t)
+                } else {
+                    t.to_string()
+                }
+            };
             let mut out = Vec::new();
             for c in criteria.values() {
-                out.push(c.what().to_string());
-                out.extend(c.examples().iter().cloned());
+                out.push(text(c.what()));
+                out.extend(c.examples().iter().map(|e| text(e)));
                 if let Some(nf) = c.not_for() {
-                    out.push(nf.to_string());
+                    out.push(text(nf));
                 }
             }
             out

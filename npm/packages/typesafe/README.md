@@ -138,6 +138,14 @@ const jev = await ts.systemOne(
 The Jev `model` field is accepted for compatibility and ignored: the local
 engine selects its own model arm under the loop's governance (ADR-004).
 
+By default a `choice` question's `instructions` are not embedded: only the
+criteria shape the answer, so "which asset do they own" and "which asset do they
+avoid" score the same. `score` already folds its instructions into each legend
+bucket. To do the same for `choice`, pass
+`createTypesafe({ engine: { choiceInstructions: true } })`: each option's `what`,
+examples and `not_for` are then embedded as `"<instructions>. <text>"`. With
+empty instructions the answers are identical to the default.
+
 ## Train, eval, serve
 
 ```sh

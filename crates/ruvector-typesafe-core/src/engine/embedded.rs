@@ -40,7 +40,7 @@ impl<E: Embedder> Engine<E> {
         if !(1..=768).contains(&dims) {
             return Err(TypesafeError::Limit("embedded dimensions must be 1..=768"));
         }
-        let texts = question_texts(question);
+        let texts = question_texts(question, self.options.choice_instructions);
         let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
         let embs = self.embedder.embed(&refs)?;
         if embs.len() != texts.len()

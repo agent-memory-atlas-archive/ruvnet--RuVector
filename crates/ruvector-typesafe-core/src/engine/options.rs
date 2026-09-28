@@ -56,6 +56,11 @@ pub struct EngineOptions {
     pub min_calibration: usize,
     /// Head selection for class questions.
     pub head: HeadChoice,
+    /// Prefix a `choice` question's `instructions` to each option's `what`,
+    /// examples and `not_for` before embedding, as `score` already does for
+    /// its legend. Off by default (original behaviour: `choice` embeds only
+    /// the criteria, so its instructions do not affect the answer).
+    pub choice_instructions: bool,
 }
 
 impl Default for EngineOptions {
@@ -72,6 +77,7 @@ impl Default for EngineOptions {
             calibration_fraction: 0.2,
             min_calibration: 20,
             head: HeadChoice::Auto,
+            choice_instructions: false,
         }
     }
 }

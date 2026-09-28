@@ -139,7 +139,7 @@ impl<E: Embedder> Engine<E> {
                     Slot::Cached(c.clone())
                 } else {
                     let start = texts.len();
-                    let t = question_texts(q);
+                    let t = question_texts(q, self.options.choice_instructions);
                     let len = t.len();
                     texts.extend(t);
                     Slot::Pending { start, len }
