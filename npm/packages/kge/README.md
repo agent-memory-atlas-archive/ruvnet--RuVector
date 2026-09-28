@@ -201,7 +201,7 @@ that have not yet been run at full scale are listed as such rather than implied.
 | Gate (ADR-006) | Status |
 |---|---|
 | Link prediction, FB15k-237 / WN18RR (MRR ≥ LibKGE ComplEx − 3 pts) | Not yet run on the full datasets; the committed FB15k-237 receipt is a 493-entity subgraph (test MRR 0.50) |
-| ANN recall@10 ≥ 0.90 | Pass on the synthetic suite (0.985) and the FB15k-237 subgraph (0.988) |
+| ANN recall@10 ≥ 0.90 | Pass on the synthetic suite (0.985) and the FB15k-237 subgraph (0.988). Below the gate on a sparser graph: 0.865 on a 3,000-entity WN18RR subgraph (2,752 entities seen, 275 test + validation queries, default `buildIndex()`), measured independently on 27 Sep 2026. Use `useIndex: false` where recall matters more than latency |
 | Adversarial confidence drop > 0 | Open: on the synthetic suite, confidence rose slightly under the symmetry-decoy attack (drop −0.059) |
 | Predict p95 latency (native) | Pass |
 | Tie-break, HolE≡ComplEx, loop safety | Not exercised by the committed receipts (HolE≡ComplEx is covered by the crate unit test) |
