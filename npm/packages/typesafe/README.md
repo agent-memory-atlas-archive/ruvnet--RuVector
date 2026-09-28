@@ -168,6 +168,10 @@ tests and wiring only. Production accuracy needs the ONNX embedder:
 const ts = createTypesafe({ embedder: { kind: 'onnx', modelDir: './models/bge', manifest: './models/manifest.json' } });
 ```
 
+Creating an engine on the `hash` embedder emits one process warning
+(`TYPESAFE_HASH_EMBEDDER`) per process, so a quick start never silently ships
+test-double answers. Tests can pass `{ warnOnHashEmbedder: false }` to silence it.
+
 ## The self-optimization loop
 
 Improvement is a governed, measured, reversible loop (ADR-004): a proposal must
