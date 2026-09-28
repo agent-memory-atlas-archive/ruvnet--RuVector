@@ -9,6 +9,7 @@ pub mod grad;
 pub mod loss;
 mod negatives;
 pub mod optim;
+pub mod par;
 
 pub use grad::Differentiable;
 pub use optim::OptimKind;
@@ -222,7 +223,21 @@ impl Trainer {
                     } else {
                         None
                     };
-                for &i in batch {
+                // Batched path: score every positive of the batch (in parallel
+                // with the `parallel` feature), then fold the results in batch
+                // order, so gradients are identical to a sequential run.
+                let mut scored: Vec<Option<loss::PositiveOut>> = match batched.as_ref() {
+                    Some(b) => {
+                        let outs = par::map_range(batch.len(), |k| {
+                            loss::batched_positive(tables, scorer, b, positives[batch[k]])
+                        });
+                        outs.into_iter()
+                            .map(|r| r.map(Some))
+                            .collect::<Result<Vec<_>>>()?
+                    }
+                    None => Vec::new(),
+                };
+                for (k, &i) in batch.iter().enumerate() {
                     let t = positives[i];
                     let data_loss = match config.loss {
                         LossKind::SelfAdversarial {
@@ -239,11 +254,16 @@ impl Trainer {
                             &mut sample_rng,
                             &mut grads,
                         )?,
-                        LossKind::OneVsAll => match batched.as_mut() {
-                            Some(b) => {
-                                loss::one_vs_all_step_batched(tables, scorer, t, b, &mut grads)?
+                        LossKind::OneVsAll => match (batched.as_mut(), scored.get_mut(k)) {
+                            (Some(b), Some(slot)) => {
+                                let out = slot.take().ok_or_else(|| {
+                                    KgeError::Invalid("batched positive scored twice".into())
+                                })?;
+                                let l = out.loss;
+                                b.absorb(out, &mut grads);
+                                l
                             }
-                            None => loss::one_vs_all_step(tables, scorer, t, &mut grads)?,
+                            _ => loss::one_vs_all_step(tables, scorer, t, &mut grads)?,
                         },
                     };
                     epoch_loss += data_loss as f64;
