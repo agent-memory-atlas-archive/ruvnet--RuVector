@@ -58,6 +58,16 @@ pub fn embed_in_chunks<T, E>(
     }
     Ok(out)
 }
+pub use manifest::{ManifestFile, ModelManifest, Pooling};
+
+#[cfg(feature = "native")]
+pub use ort_backend::OrtEmbedder;
+
+#[cfg(feature = "wasm")]
+pub use tract_backend::{diagnose_load, LoadOutcome, TractEmbedder};
+
+// Re-export the trait so callers need only this crate.
+pub use ruvector_typesafe_core::Embedder;
 
 #[cfg(test)]
 mod chunk_tests {
@@ -101,13 +111,3 @@ mod chunk_tests {
         assert_eq!(calls, 2);
     }
 }
-pub use manifest::{ManifestFile, ModelManifest, Pooling};
-
-#[cfg(feature = "native")]
-pub use ort_backend::OrtEmbedder;
-
-#[cfg(feature = "wasm")]
-pub use tract_backend::{diagnose_load, LoadOutcome, TractEmbedder};
-
-// Re-export the trait so callers need only this crate.
-pub use ruvector_typesafe_core::Embedder;

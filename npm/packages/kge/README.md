@@ -219,8 +219,9 @@ that have not yet been run at full scale are listed as such rather than implied.
 ## Notes
 
 - **Duplicate facts.** `addTriples` stores every triple it is given (and counts
-  them in `added`), but training builds a de-duplicated `TripleStore`, so
-  repeating a fact does not weight it.
+  them in `added`), but training builds a de-duplicated `TripleStore`, so by
+  default repeating a fact does not weight it. Opt in with `duplicates: 'count'`
+  or `'log'` (see Training above).
 - **Regularisation.** The trainer's default N3 weight is `1e-3`. For
   ComplEx-style models a larger weight (e.g. `n3_lambda: 0.05` in `train`)
   often scores better; tune it on your validation split.

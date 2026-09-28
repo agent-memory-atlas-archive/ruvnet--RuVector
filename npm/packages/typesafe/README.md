@@ -99,9 +99,10 @@ From an independent evaluation (25–27 Sep 2026, bge-small-en-v1.5, native ONNX
 build); details and reproduction in the
 [Typed Decisions Lab](https://typesafe-lab-276367410975.europe-west2.run.app).
 
-- **`choice` does not read `instructions`.** Only the option criteria are
-  embedded, so changing "Which team should *own* this" to "*avoid* this" gives
-  the same answer. Put the intent into the option descriptions.
+- **`choice` does not read `instructions` by default.** Only the option
+  criteria are embedded, so changing "Which team should *own* this" to "*avoid*
+  this" gives the same answer. Put the intent into the option descriptions, or
+  opt in with `engine: { choiceInstructions: true }`.
 - **Negation.** Embeddings barely separate a predicate from its negation: on one
   urgent message, "needs a response soon" scored 0.84 and "does NOT need a
   response soon" 0.81. Phrase predicates positively and add labelled examples.
@@ -113,13 +114,18 @@ build); details and reproduction in the
   its AUROC is 0.90 with all 150 intents and 0.94–0.97 on 8-intent subsets. Its
   values are small, though, and shrink as the option count grows (median 0.002
   at 150 options) and after training, so a fixed threshold does not carry
-  across questions. An explicit `other` option caught 17% of off-topic states
+  across questions. An ordinary `other` option caught 17% of off-topic states
   with 24% false alarms. Treat `abstain` as a relative score and tune any
-  threshold per question.
+  threshold per question, or use `abstainMode: 'sigmoid'` and a `catchAll`
+  option (both below).
 - **Calibration needs data.** `calibrated` stays `false` until the calibration
   slice has 20 examples, which at the default split means about 100 labels per
-  question.
-**Out-of-scope scores.** `abstain` ranks off-topic inputs well: on CLINC150
+  question. `engine: { crossfitCalibration: true }` needs about 20 labels in
+  total instead.
+
+### Out-of-scope scores
+
+`abstain` ranks off-topic inputs well: on CLINC150
 (bge-small, zero-shot) its AUROC for the 1,000 out-of-scope test utterances is
 0.90 with all 150 intents and 0.94–0.97 on 8-intent subsets. By default it is
 the abstain share of a (K+1)-way softmax, so its scale depends on the option
@@ -131,6 +137,7 @@ depend on K or training. A threshold tuned on CLINC150's 150-intent validation
 split (0.336) then caught 78% of test out-of-scope items at 14% false alarms, and
 92–97% at 11–19% on 8-intent subsets. `choice`, `probabilities` and
 `confidence` are the same in both modes.
+
 ### Off-topic inputs: a catch-all option
 
 Adding an option such as `other: 'Anything else'` to a `choice` question does

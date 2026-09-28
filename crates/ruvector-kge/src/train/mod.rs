@@ -193,7 +193,7 @@ impl Trainer {
             .iter()
             .flat_map(|t| {
                 let n = multiplicity.get(t).copied().unwrap_or(1);
-                std::iter::repeat(*t).take(weighting.repeats(n))
+                std::iter::repeat_n(*t, weighting.repeats(n))
             })
             .collect();
         let n = positives.len();

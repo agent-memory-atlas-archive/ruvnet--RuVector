@@ -542,13 +542,15 @@ mod candle_impl {
             else {
                 return false;
             };
+            // All-or-nothing: dropping one malformed entry would shift every later
+            // token id, so any non-string entry yields an empty list (rejected below).
             let strings = |key: &str| -> Vec<String> {
                 md.get(key)
                     .and_then(|v| v.to_vec().ok())
-                    .map(|vs| {
+                    .and_then(|vs| {
                         vs.iter()
-                            .filter_map(|v| v.to_string().ok().cloned())
-                            .collect()
+                            .map(|v| v.to_string().ok().cloned())
+                            .collect::<Option<Vec<_>>>()
                     })
                     .unwrap_or_default()
             };
@@ -557,7 +559,12 @@ mod candle_impl {
             let types: Option<Vec<i32>> = md
                 .get("tokenizer.ggml.token_type")
                 .and_then(|v| v.to_vec().ok())
-                .map(|vs| vs.iter().filter_map(|v| v.to_i32().ok()).collect());
+                .and_then(|vs| {
+                    vs.iter()
+                        .map(|v| v.to_i32().ok())
+                        .collect::<Option<Vec<_>>>()
+                })
+                .filter(|t| t.len() == tokens.len());
             match crate::backends::gguf_tokenizer::from_gguf_parts(
                 &model,
                 &tokens,

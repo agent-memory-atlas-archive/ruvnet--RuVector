@@ -26,4 +26,7 @@ test('signed save verifies with the key and rejects edits, wrong keys and unsign
   expectInvalid(() => loadKge(kge.save(), { key: KEY }), 'unsigned model');
   expectInvalid(() => loadKge(signed.replace('"Ada"', '"Eve"'), { key: KEY }), 'edited payload');
   expectInvalid(() => kge.save({ key: 'short' }), 'key too short');
+  // A key option that is present but unset (e.g. a missing env var) fails closed.
+  expectInvalid(() => loadKge(kge.save(), { key: undefined }), 'undefined key on load');
+  expectInvalid(() => kge.save({ key: undefined }), 'undefined key on save');
 });

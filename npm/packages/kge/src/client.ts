@@ -123,11 +123,11 @@ function wrap<R extends string>(binding: Binding, model: ModelInstance): Kge<R> 
     optimize: (spec) =>
       parse<OptimizeReport>(model.optimizeJson(JSON.stringify(spec ?? {}))),
     save: (opts) => {
-      if (opts?.key === undefined) return model.toJson();
+      if (!hasKey(opts)) return model.toJson();
       if (typeof model.toJsonSigned !== 'function') {
         throw new KgeError('this binding cannot sign models; rebuild @ruvector/kge', 'unavailable');
       }
-      return callOrInvalid(() => model.toJsonSigned!(opts.key!));
+      return callOrInvalid(() => model.toJsonSigned!(opts!.key!));
     },
     stats: () => parse<Stats>(model.statsJson()),
   };
@@ -166,7 +166,7 @@ export function loadKge<R extends string = string>(
   opts: { binding?: Binding; schema?: Schema<R>; key?: string } = {},
 ): Kge<R> {
   const binding = requireBinding(opts.binding);
-  if (opts.key !== undefined) {
+  if (hasKey(opts)) {
     const verify = binding.Model.fromJsonVerified;
     if (typeof verify !== 'function') {
       throw new KgeError('this binding cannot verify signed models; rebuild @ruvector/kge', 'unavailable');
@@ -176,6 +176,19 @@ export function loadKge<R extends string = string>(
   }
   const model = callOrInvalid(() => binding.Model.fromJson(modelJson));
   return wrap<R>(binding, model);
+}
+
+/**
+ * True when the caller asked for signing/verification. A `key` property that
+ * is present but not a string (e.g. an unset `process.env` variable) throws
+ * rather than silently falling back to the unsigned path.
+ */
+function hasKey(opts?: { key?: unknown }): boolean {
+  if (!opts || !Object.prototype.hasOwnProperty.call(opts, 'key')) return false;
+  if (typeof opts.key !== 'string') {
+    throw new KgeError('key must be a string; got ' + typeof opts.key, 'invalid');
+  }
+  return true;
 }
 
 /** Run a binding call that throws plain errors, rethrowing as KgeError{invalid}. */

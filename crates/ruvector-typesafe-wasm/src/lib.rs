@@ -59,6 +59,9 @@ struct TrainInput {
     /// head calibrates on exactly these rows instead of a carve of `examples`.
     #[serde(default)]
     calibration: Vec<ExampleInput>,
+    /// Optional question kind; overrides the head `train` infers (matches the FFI).
+    #[serde(default)]
+    kind: Option<ruvector_typesafe_core::engine::QuestionKind>,
 }
 
 fn to_labeled(rows: Vec<ExampleInput>) -> Vec<LabeledExample> {
@@ -146,12 +149,9 @@ impl Engine {
         };
         let examples = to_labeled(input.examples);
         let calibration = to_labeled(input.calibration);
-        let result = if calibration.is_empty() {
-            self.inner.train(&input.question, &examples)
-        } else {
-            self.inner
-                .train_with_calibration(&input.question, &examples, &calibration)
-        };
+        let result = self
+            .inner
+            .train_typed(&input.question, input.kind, &examples, &calibration);
         match result {
             Ok(report) => {
                 serde_json::to_string(&report).unwrap_or_else(|e| embedder_json(&e.to_string()))

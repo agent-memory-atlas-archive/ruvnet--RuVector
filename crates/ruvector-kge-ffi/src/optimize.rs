@@ -249,8 +249,14 @@ mod default_grid_tests {
         let g = default_grid(64);
         assert!(g.n3_lambdas.len() >= 2, "N3 must be searched, not fixed");
         assert!(g.n3_lambdas.iter().any(|&l| l > 0.0));
-        assert!(validate_grid(&g).is_none(), "default grid must pass its own caps");
+        assert!(
+            validate_grid(&g).is_none(),
+            "default grid must pass its own caps"
+        );
         let size = g.dims.len() * g.lrs.len() * g.losses.len() * g.n3_lambdas.len();
-        assert!(size as u32 <= default_budget(), "grid fits the default budget");
+        assert!(
+            size as u32 <= default_budget(),
+            "grid fits the default budget"
+        );
     }
 }
