@@ -26,9 +26,10 @@ arXiv:1902.10197), the one family member that represents relation
 
 ## Status (v1)
 
-- **No platform packages yet.** The first release ships the WASM fallback and
-  builds the native addon locally; the five `optionalDependencies` platform
-  packages are added in a later bump PR (ADR-001 §5).
+- **Platforms.** 0.1.0 bundles the native addon for `linux-x64-gnu` plus the
+  WASM fallback; other platforms use WASM until the five `optionalDependencies`
+  platform packages are added in a later bump PR (ADR-001 §5).
+  `KGE_BACKEND=wasm` forces the fallback.
 - **`predict`, `similarRelations`, `compose`, `train`, `eval`, `buildIndex` and
   `optimize` all work today.** `predict` is exhaustive until you `buildIndex`,
   then ANN-accelerated. Before `train`, the tables are the deterministic seed
@@ -86,15 +87,21 @@ tails.candidates[0].entity;   // best-ranked object
 // Relation similarity (cosine over relation vectors):
 kge.similarRelations({ r: 'bornIn', k: 5 });
 
-// Save / restore (the envelope carries a sha256; load fails closed on a tamper):
+// Save / restore (the envelope carries a sha256; load fails closed on a mismatch):
 const saved = kge.save();
 import { loadKge } from '@ruvector/kge';
 const restored = loadKge(saved);
+
+// Signed save / restore: the envelope also carries an HMAC-SHA256 under your key
+// (at least 16 bytes), and load rejects edits made without it:
+const signed = kge.save({ key: process.env.KGE_MODEL_KEY });
+const trusted = loadKge(signed, { key: process.env.KGE_MODEL_KEY });
 ```
 
 Errors are thrown as `KgeError` with a `.kind` in
 `limit | invalid | unavailable | unsupported | scorer`; success payloads never
-throw.
+throw. A malformed or tampered `save()` envelope makes `loadKge` throw
+`KgeError{kind:'invalid'}`.
 
 ## Quick start (CLI)
 
@@ -118,9 +125,10 @@ method, path, status and milliseconds only — never the request body.
 | `similarRelations` | `{r, k}` | `{relations:[{relation,score}]}` |
 | `compose` | `{r1, r2, s, k}` (RotatE) | `{candidates:[{entity,score}], exact, ann}` |
 
-`exact:true, ann:false` marks the exhaustive path; the
-`DistanceMetric::DotProduct` HNSW path (ADR-001 §3) flips these once the ANN
-index build lands.
+`exact:true, ann:false` marks the exhaustive path. After `buildIndex()`,
+`predict` uses the `DistanceMetric::DotProduct` HNSW path (ADR-001 §3) and
+returns `exact:false, ann:true`; pass `useIndex:false` to force exhaustive
+scoring.
 
 ## Training, evaluation, optimization
 
@@ -132,6 +140,10 @@ r.report.combined.mrr;
 ```
 
 - `train(config)` / `kge train` — mini-batch training over the tables (ADR-003).
+  Training de-duplicates the store; if you add the same fact several times to
+  record how often it occurs, pass `duplicates: 'count'` (train it once per
+  occurrence, capped at 1,000) or `'log'` (`1 + floor(ln n)` times). The
+  default, `'ignore'`, keeps the previous behaviour.
 - `evaluate(config)` / `kge eval` — filtered ranking metrics. **Split tags are
   honoured verbatim**: tag triples on ingest (`addTriples([{s,r,o,split:'test'}])`)
   and `train` uses only the `train` split while `eval({split:'test'})` scores
@@ -162,7 +174,12 @@ r.report.combined.mrr;
   (`scripts/check-wasm-imports.mjs`, run in the wasm build).
 - **Triple and label text is never logged**; errors carry numeric ids only.
 - **Saved models are content-hashed** (sha256 envelope); load fails closed on a
-  mismatch.
+  mismatch. The sha256 catches corruption, but anyone can recompute it after an
+  edit. For tamper evidence, save with `{ key }` and load with the same key:
+  the envelope then carries an HMAC-SHA256, and `loadKge` throws
+  `KgeError{kind:'invalid'}` for an unsigned, edited or wrongly keyed model.
+  Signed envelopes still load without a key. Signing needs a binding built from
+  this version (native, or a rebuilt WASM package).
 - **Input limits**, rejected with a typed error, never truncated: ≤ 1M
   entities, ≤ 100k relations, label ≤ 1 KiB, `k` ≤ 1000.
 
@@ -185,6 +202,29 @@ wasm32 — holds.
 Link-prediction quality (filtered MRR / Hits@k on FB15k-237, WN18RR, CoDEx-M),
 ANN recall, and latency are **to be measured by `kge bench`** (ADR-006); no
 numbers are quoted here until that harness writes them.
+
+## Release-gate status (0.1.0)
+
+From the committed receipts in `bench/results/` (21 Sep 2026). ADR-006 gates
+that have not yet been run at full scale are listed as such rather than implied.
+
+| Gate (ADR-006) | Status |
+|---|---|
+| Link prediction, FB15k-237 / WN18RR (MRR ≥ LibKGE ComplEx − 3 pts) | Not yet run on the full datasets; the committed FB15k-237 receipt is a 493-entity subgraph (test MRR 0.50) |
+| ANN recall@10 ≥ 0.90 | Pass on the synthetic suite (0.985) and the FB15k-237 subgraph (0.988). Below the gate on a sparser graph: 0.865 on a 3,000-entity WN18RR subgraph (2,752 entities seen, 275 test + validation queries, default `buildIndex()`), measured independently on 27 Sep 2026. Use `useIndex: false` where recall matters more than latency |
+| Adversarial confidence drop > 0 | Open: on the synthetic suite, confidence rose slightly under the symmetry-decoy attack (drop −0.059) |
+| Predict p95 latency (native) | Pass |
+| Tie-break, HolE≡ComplEx, loop safety | Not exercised by the committed receipts (HolE≡ComplEx is covered by the crate unit test) |
+
+## Notes
+
+- **Duplicate facts.** `addTriples` stores every triple it is given (and counts
+  them in `added`), but training builds a de-duplicated `TripleStore`, so by
+  default repeating a fact does not weight it. Opt in with `duplicates: 'count'`
+  or `'log'` (see Training above).
+- **Regularisation.** The trainer's default N3 weight is `1e-3`. For
+  ComplEx-style models a larger weight (e.g. `n3_lambda: 0.05` in `train`)
+  often scores better; tune it on your validation split.
 
 ## Design records
 

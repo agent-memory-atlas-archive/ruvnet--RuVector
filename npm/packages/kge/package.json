@@ -1,6 +1,6 @@
 {
   "name": "@ruvector/kge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Holographic knowledge-graph embeddings (HolE / RotatE) for ruvector: link prediction, relation composition and compositional queries, with ANN candidate retrieval over HNSW. Native (napi-rs) with a WASM fallback; no network.",
   "license": "MIT",
   "repository": { "type": "git", "url": "https://github.com/ruvnet/ruvector.git", "directory": "npm/packages/kge" },

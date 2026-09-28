@@ -10,6 +10,8 @@ import type { ScorerKind } from './types';
 /** One model instance: JSON-in / JSON-out, mirroring the Rust `Model` class. */
 export interface ModelInstance {
   toJson(): string;
+  /** Signed envelope (HMAC-SHA256 under `key`); present in bindings built after 0.1.0. */
+  toJsonSigned?(key: string): string;
   addTriplesJson(triplesJson: string): string;
   predictJson(queryJson: string): string;
   similarRelationsJson(queryJson: string): string;
@@ -27,6 +29,8 @@ export interface ModelInstance {
 export interface ModelCtor {
   new (optionsJson: string): ModelInstance;
   fromJson(modelJson: string): ModelInstance;
+  /** Load a signed envelope, requiring its HMAC to verify under `key`. */
+  fromJsonVerified?(modelJson: string, key: string): ModelInstance;
 }
 
 export interface Binding {

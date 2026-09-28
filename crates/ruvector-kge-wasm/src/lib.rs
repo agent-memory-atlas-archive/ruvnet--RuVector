@@ -60,6 +60,24 @@ impl Model {
         self.inner.to_json()
     }
 
+    /// Rebuild a model from a signed envelope, requiring its HMAC to verify
+    /// under `key`; throws when unsigned, edited, or the key is wrong.
+    #[wasm_bindgen(js_name = fromJsonVerified)]
+    pub fn from_json_verified(model_json: &str, key: &str) -> std::result::Result<Model, JsValue> {
+        KgeModel::from_json_verified(model_json, key)
+            .map(|inner| Model { inner })
+            .map_err(|e| JsValue::from_str(&e))
+    }
+
+    /// Serialize to `{"sha256","hmac_sha256","model"}` signed with `key`
+    /// (at least 16 bytes).
+    #[wasm_bindgen(js_name = toJsonSigned)]
+    pub fn to_json_signed(&self, key: &str) -> std::result::Result<String, JsValue> {
+        self.inner
+            .to_json_signed(key)
+            .map_err(|e| JsValue::from_str(&e))
+    }
+
     /// Admit `[{"s","r","o"}]`. Returns a summary or error JSON.
     #[wasm_bindgen(js_name = addTriplesJson)]
     pub fn add_triples_json(&mut self, triples_json: &str) -> String {

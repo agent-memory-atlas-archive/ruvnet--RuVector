@@ -35,7 +35,9 @@ export function sha256(bytes) {
 // `files` must stay identical to the fixture pin recorded in the frozen
 // 2026-09-21 receipts (scripts/verify-release-bench.mjs asserts that), and
 // verifyFixtureHashes / receipts only cover FROZEN_FILES.
-export const DERIVED_FILES = ['fixtures/novel-slice-2026-09-26.json'];
+// The independent live Jev re-run (jev-live-2026-09-25.json, continuous noul
+// kept) is pinned here for the same reason: it is added after the release pin.
+export const DERIVED_FILES = ['fixtures/novel-slice-2026-09-26.json', 'jev-live-2026-09-25.json'];
 
 /** Hash every frozen file. Returns { relPath: sha256 }. Throws if one is absent. */
 export function computeHashes(benchDir = BENCH_DIR, files = FROZEN_FILES) {

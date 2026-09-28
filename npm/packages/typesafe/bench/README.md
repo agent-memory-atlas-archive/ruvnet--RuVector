@@ -25,8 +25,13 @@ Flags: `--suite tickets|banking77|clinc150|hwu64|all` · `--arm jev|local|both` 
   number: its `test_rows.baseline` were scored with the same gen-0 criteria the
   local arm sends, so the comparison is apples-to-apples. Jev's champion used
   mutated criteria whose examples are literal ticket texts (memorisation,
-  ADR-004) and is reported as informational only. Jev exposes no `noul`
-  probability, so urgent AUROC/Brier are not defined for the jev arm.
+  ADR-004) and is reported as informational only. The 2026-09-21 capture kept
+  only a 0.5-threshold urgent boolean, so urgent AUROC is not defined for it.
+  Jev does return a continuous `noul`: `jev-live-2026-09-25.json` (an
+  independent live re-run of the same test split with jev-1.13.0, pinned under
+  `HASHES.json` `derived`) keeps it in `scores`, and is reported as
+  `jev_live`: department 84.7%, urgent 58.7% at a 0.5 threshold, urgent AUROC
+  0.941.
 - **local** — the ruvector binding (`../index.js`: `Engine`, `version`,
   `backend`). Builds one request per item and times `decideJson`. Supports
   SetFit-style few-shot (train on the train split, N/class **per question**)

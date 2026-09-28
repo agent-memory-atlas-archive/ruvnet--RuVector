@@ -114,6 +114,11 @@ export interface LabeledExample {
   label: string;
 }
 
+/** Optional `train` settings. `kind` mirrors `engine.rs::QuestionKind`. */
+export interface TrainOptions {
+  kind?: 'choice' | 'score' | 'noul';
+}
+
 /** Result of `train` (mirrors `engine.rs::TrainReport`). */
 export interface TrainReport {
   question: string;

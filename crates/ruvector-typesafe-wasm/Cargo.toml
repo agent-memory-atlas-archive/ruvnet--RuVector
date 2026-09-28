@@ -1,6 +1,6 @@
 [package]
 name = "ruvector-typesafe-wasm"
-version.workspace = true
+version = "2.4.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -30,12 +30,12 @@ wasm-onnx = ["dep:ruvector-embed-core", "ruvector-embed-core/wasm"]
 wasm-opt = ['-Oz', '--enable-bulk-memory', '--enable-sign-ext', '--enable-nontrapping-float-to-int']
 
 [dependencies]
-ruvector-typesafe-core = { version = "2.3", path = "../ruvector-typesafe-core" }
+ruvector-typesafe-core = { version = "2.4", path = "../ruvector-typesafe-core" }
 wasm-bindgen = { workspace = true }
 js-sys = "0.3"
 serde = { workspace = true }
 serde_json = { workspace = true }
-ruvector-embed-core = { version = "2.3", path = "../ruvector-embed-core", default-features = false, optional = true }
+ruvector-embed-core = { version = "2.4", path = "../ruvector-embed-core", default-features = false, optional = true }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"

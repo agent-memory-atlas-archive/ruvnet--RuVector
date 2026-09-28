@@ -328,3 +328,108 @@ fn empty_calibration_is_bit_identical_to_plain_train() {
     let b = serde_json::to_string(&two.decide(&req).unwrap()).unwrap();
     assert_eq!(a, b);
 }
+
+#[test]
+fn train_typed_reports_the_head_decide_will_use() {
+    let rows: Vec<LabeledExample> = (0..12)
+        .map(|i| LabeledExample {
+            text: format!(
+                "message number {i} about {}",
+                if i % 2 == 0 { "refunds" } else { "logins" }
+            ),
+            label: if i % 2 == 0 {
+                "yes".into()
+            } else {
+                "no".into()
+            },
+        })
+        .collect();
+    // Label inference (no kind): boolean-looking labels read as a noul.
+    let mut a = Engine::new(HashEmbedder::new(DIMS));
+    assert_eq!(a.train("q", &rows).unwrap().head, Head::Logistic);
+    // Declared choice: a class head, never logistic.
+    let mut b = Engine::new(HashEmbedder::new(DIMS));
+    let rep = b
+        .train_typed("q", Some(QuestionKind::Choice), &rows, &[])
+        .unwrap();
+    assert_ne!(
+        rep.head,
+        Head::Logistic,
+        "a choice question is answered by a class head"
+    );
+    // Declared noul: logistic.
+    let mut c = Engine::new(HashEmbedder::new(DIMS));
+    assert_eq!(
+        c.train_typed("q", Some(QuestionKind::Noul), &rows, &[])
+            .unwrap()
+            .head,
+        Head::Logistic
+    );
+}
+
+#[test]
+fn crossfit_calibrates_a_bank_too_small_for_the_holdout_slice() {
+    // 40 examples: the every-5th slice holds 8 (< 20), so the default stays
+    // uncalibrated; cross-fitting pools all 40 out-of-fold and calibrates.
+    let small: Vec<LabeledExample> = many_examples()
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| i % 3 == 0)
+        .map(|(_, e)| e)
+        .collect();
+    assert_eq!(small.len(), 40);
+    let req = two_topic_request("storm rain clouds sunny forecast");
+
+    let mut default = Engine::new(ProdLike::new(DIMS));
+    default.train("q", &small).unwrap();
+    let d = default.decide(&req).unwrap();
+    let (d_choice, _, d_meta) = as_choice(&d.answers["q"]);
+    assert!(!d_meta.calibrated, "8-example slice is below the floor");
+
+    let opts = EngineOptions {
+        crossfit_calibration: true,
+        ..EngineOptions::default()
+    };
+    let mut cross = Engine::with_options(ProdLike::new(DIMS), opts.clone());
+    let report = cross.train("q", &small).unwrap();
+    assert!(report.calibrated, "the train report should match decide");
+    let c = cross.decide(&req).unwrap();
+    let (c_choice, _, c_meta) = as_choice(&c.answers["q"]);
+    assert!(
+        c_meta.calibrated,
+        "cross-fitting should calibrate 40 labels"
+    );
+    assert!((c_meta.temperature - 1.0).abs() > 1e-6);
+    assert_eq!(c_choice, d_choice, "temperature never changes the argmax");
+
+    // Deterministic, and never used for the test double.
+    let mut again = Engine::with_options(ProdLike::new(DIMS), opts.clone());
+    again.train("q", &small).unwrap();
+    assert_eq!(
+        serde_json::to_string(&again.decide(&req).unwrap()).unwrap(),
+        serde_json::to_string(&c).unwrap()
+    );
+    let mut double = Engine::with_options(HashEmbedder::new(DIMS), opts);
+    double.train("q", &small).unwrap();
+    let t = double.decide(&req).unwrap();
+    let (_, _, t_meta) = as_choice(&t.answers["q"]);
+    assert!(!t_meta.calibrated);
+}
+
+#[test]
+fn crossfit_leaves_a_large_bank_on_the_holdout_path() {
+    // 120 examples clear the floor, so both settings take the original path.
+    let opts = EngineOptions {
+        crossfit_calibration: true,
+        ..EngineOptions::default()
+    };
+    let mut cross = Engine::with_options(ProdLike::new(DIMS), opts);
+    cross.train("q", &many_examples()).unwrap();
+    let mut plain = Engine::new(ProdLike::new(DIMS));
+    plain.train("q", &many_examples()).unwrap();
+    let req = two_topic_request("storm rain clouds sunny forecast");
+    assert_eq!(
+        serde_json::to_string(&cross.decide(&req).unwrap()).unwrap(),
+        serde_json::to_string(&plain.decide(&req).unwrap()).unwrap()
+    );
+}

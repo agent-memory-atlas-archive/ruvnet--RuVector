@@ -24,22 +24,22 @@ import { RuvLLM, RuvLLMConfig } from '@ruvector/ruvllm';
 const llm = new RuvLLM();
 
 // Or with custom configuration
-const llm = new RuvLLM({
-  modelPath: './models/ruvltra-small-q4km.gguf',
-  sonaEnabled: true,
-  flashAttention: true,
-  maxTokens: 256,
-});
+const llm = new RuvLLM({ embeddingDim: 384, learningEnabled: true });
 
-// Generate text
-const response = await llm.query('Explain quantum computing');
-console.log(response.text);
-
-// Stream generation
-for await (const token of llm.stream('Write a haiku about Rust')) {
-  process.stdout.write(token);
-}
+// Routing, memory and embeddings
+const decision = llm.route('Explain quantum computing');
+llm.addMemory('RuvLLM routes queries with FastGRNN', { source: 'docs' });
+const hits = llm.searchMemory('how are queries routed?', 3);
+const vec = llm.embed('Explain quantum computing');
 ```
+
+> **Text generation.** This package does not load model files (`modelPath` is
+> ignored), and the native engine has no language-model weights, so the text
+> returned by `generate()` and `query()` is not model output. The first such
+> call emits a `RUVLLM_NO_LANGUAGE_MODEL` warning; pass `{ strict: true }` to
+> throw instead. For GGUF inference, run the CLI (`ruvllm serve <model>`, with
+> `--strict` to exit if the model fails to load) or any OpenAI-compatible
+> server, and call it over HTTP.
 
 ## What's New in v2.5
 
@@ -106,14 +106,20 @@ ruvllm eval --model ./models/model.gguf --subset lite --max-tasks 50
 class RuvLLM {
   constructor(config?: RuvLLMConfig);
 
-  // Generate text
-  query(prompt: string, params?: GenerateParams): Promise<Response>;
+  // Routed query; text is not model output (see "Text generation" above)
+  query(text: string, config?: GenerationConfig): QueryResponse;
 
-  // Stream generation
-  stream(prompt: string, params?: GenerateParams): AsyncIterable<string>;
+  // Text from the native engine; not model output (see above)
+  generate(prompt: string, config?: GenerationConfig): string;
 
-  // Load a model
-  loadModel(path: string): Promise<void>;
+  // Routing, memory and embeddings
+  route(text: string): RoutingDecision;
+  addMemory(content: string, metadata?: Record<string, unknown>): MemoryId;
+  searchMemory(text: string, k?: number): MemoryResult[];
+  embed(text: string): Embedding;
+
+  // Not in this package: loadModel(), stream() (streaming lives in
+  // StreamingGenerator), mistral-rs backends. Use the ruvllm CLI for GGUF.
 
   // Get SONA learning stats
   sonaStats(): SonaStats | null;
@@ -127,7 +133,8 @@ class RuvLLM {
 
 ```typescript
 interface RuvLLMConfig {
-  modelPath?: string;       // Path to GGUF model
+  modelPath?: string;       // Not supported: ignored with a RUVLLM_UNSUPPORTED_OPTION warning
+  strict?: boolean;         // Throw instead of warning about placeholder text (default: false)
   sonaEnabled?: boolean;    // Enable SONA learning (default: true)
   flashAttention?: boolean; // Use Flash Attention 2 (default: true)
   maxTokens?: number;       // Max generation tokens (default: 256)

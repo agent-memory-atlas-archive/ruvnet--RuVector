@@ -299,6 +299,22 @@ jobs:
 
           echo "all five platform packages handled"
 
+      - name: Setup Rust (wasm32) for the WASM fallback
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Build the WASM fallback bundled in the meta package
+        shell: bash
+        run: |
+          bash npm/packages/kge/scripts/build-wasm.sh
+          # wasm-pack writes a '*' .gitignore that would drop the build from the tarball
+          rm -f npm/packages/kge/wasm/.gitignore npm/packages/kge/wasm/bundler/.gitignore
+
       - name: Publish the meta package (only after all five platforms verified)
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -329,7 +345,7 @@ jobs:
           cd npm/packages/kge
           if [ "$DRY_RUN" = "true" ]; then
             npm publish --access public --dry-run --ignore-scripts 2>&1 | tee "$RUNNER_TEMP/pack.txt"
-            for f in dist/index.js native/kge.linux-x64-gnu.node native/kge.linux-arm64-gnu.node native/kge.darwin-x64.node native/kge.darwin-arm64.node native/kge.win32-x64-msvc.node; do
+            for f in dist/index.js wasm/ruvector_kge_wasm_bg.wasm native/kge.linux-x64-gnu.node native/kge.linux-arm64-gnu.node native/kge.darwin-x64.node native/kge.darwin-arm64.node native/kge.win32-x64-msvc.node; do
               if ! grep -q "$f" "$RUNNER_TEMP/pack.txt"; then
                 echo "::error::dry-run tarball is missing $f"
                 exit 1

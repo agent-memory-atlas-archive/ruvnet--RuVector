@@ -76,6 +76,15 @@ impl Grads {
         );
     }
 
+    #[cfg(test)]
+    pub(crate) fn entity_rows(&self) -> &BTreeMap<u32, Vec<f32>> {
+        &self.ent
+    }
+    #[cfg(test)]
+    pub(crate) fn relation_rows(&self) -> &BTreeMap<u32, Vec<f32>> {
+        &self.rel
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.ent.is_empty() && self.rel.is_empty()
     }

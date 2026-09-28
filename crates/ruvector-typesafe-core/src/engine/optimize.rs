@@ -90,6 +90,10 @@ pub struct CampaignSpec {
     pub created_seq_base: u64,
     #[serde(default)]
     pub created: Option<String>,
+    /// Chain hash for this campaign's receipts (`"fnv1a128"` default, or
+    /// `"sha256"` for a tamper-evident chain; see [`crate::receipt::HashAlg`]).
+    #[serde(default)]
+    pub receipt_hash: crate::receipt::HashAlg,
 }
 
 /// One arm's outcome inside a campaign.

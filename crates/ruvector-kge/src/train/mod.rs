@@ -9,6 +9,7 @@ pub mod grad;
 pub mod loss;
 mod negatives;
 pub mod optim;
+pub mod par;
 
 pub use grad::Differentiable;
 pub use optim::OptimKind;
@@ -17,6 +18,7 @@ use crate::data::{Rng, TripleStore};
 use crate::{KgeError, Result, Tables};
 use optim::{Grads, Optimizer};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Which training regime to run (ADR-003 §1). A bandit arm, not hardcoded.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
@@ -84,6 +86,40 @@ fn n3_lambda_default() -> f32 {
     1e-3
 }
 
+/// How repeated facts in the training input are weighted.
+///
+/// A [`TripleStore`] de-duplicates its triples, so by default a fact seen
+/// 1,000 times trains exactly like a fact seen once. When the input carries
+/// real frequencies (e.g. one triple per support ticket), pass a multiplicity
+/// map to [`Trainer::fit_with_multiplicity`] and choose how it is used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DuplicateWeighting {
+    /// Every distinct fact counts once (the historical behaviour).
+    #[default]
+    Ignore,
+    /// A fact seen `n` times is trained `n` times per epoch (capped at
+    /// [`MAX_FACT_REPEATS`]).
+    Count,
+    /// A fact seen `n` times is trained `1 + floor(ln n)` times per epoch.
+    Log,
+}
+
+/// Upper bound on per-epoch repeats of one fact under [`DuplicateWeighting::Count`].
+pub const MAX_FACT_REPEATS: u32 = 1_000;
+
+impl DuplicateWeighting {
+    /// Per-epoch repeats for a fact seen `n` times (`n = 0` is treated as 1).
+    pub fn repeats(self, n: u32) -> usize {
+        let n = n.max(1);
+        match self {
+            DuplicateWeighting::Ignore => 1,
+            DuplicateWeighting::Count => n.min(MAX_FACT_REPEATS) as usize,
+            DuplicateWeighting::Log => 1 + (n as f64).ln().floor() as usize,
+        }
+    }
+}
+
 impl Default for TrainConfig {
     fn default() -> Self {
         Self {
@@ -124,11 +160,42 @@ impl Trainer {
         scorer: &dyn Differentiable,
         store: &TripleStore,
         config: &TrainConfig,
+        callback: impl FnMut(&Progress),
+    ) -> Result<()> {
+        Self::fit_with_multiplicity(
+            tables,
+            scorer,
+            store,
+            &HashMap::new(),
+            DuplicateWeighting::Ignore,
+            config,
+            callback,
+        )
+    }
+
+    /// As [`Trainer::fit`], but each distinct fact in `store` is trained
+    /// [`DuplicateWeighting::repeats`] times per epoch, using its count in
+    /// `multiplicity` (facts missing from the map count once). With
+    /// [`DuplicateWeighting::Ignore`] this is exactly [`Trainer::fit`].
+    pub fn fit_with_multiplicity(
+        tables: &mut Tables,
+        scorer: &dyn Differentiable,
+        store: &TripleStore,
+        multiplicity: &HashMap<crate::Triple, u32>,
+        weighting: DuplicateWeighting,
+        config: &TrainConfig,
         mut callback: impl FnMut(&Progress),
     ) -> Result<()> {
         validate(tables, scorer, store, config)?;
 
-        let positives = store.triples().to_vec();
+        let positives: Vec<crate::Triple> = store
+            .triples()
+            .iter()
+            .flat_map(|t| {
+                let n = multiplicity.get(t).copied().unwrap_or(1);
+                std::iter::repeat_n(*t, weighting.repeats(n))
+            })
+            .collect();
         let n = positives.len();
         if n == 0 {
             return Ok(());
@@ -147,7 +214,30 @@ impl Trainer {
 
             for batch in order.chunks(config.batch_size) {
                 let mut grads = Grads::new(config.dims);
-                for &i in batch {
+                // Multilinear scorers (HolE) take the batched 1-vs-all path:
+                // one index-vector build per batch instead of 4·|E| score/grad
+                // calls per positive. Identical loss and gradients.
+                let mut batched =
+                    if matches!(config.loss, LossKind::OneVsAll) && scorer.multilinear() {
+                        Some(loss::BatchedOneVsAll::new(tables, scorer)?)
+                    } else {
+                        None
+                    };
+                // Batched path: score every positive of the batch (in parallel
+                // with the `parallel` feature), then fold the results in batch
+                // order, so gradients are identical to a sequential run.
+                let mut scored: Vec<Option<loss::PositiveOut>> = match batched.as_ref() {
+                    Some(b) => {
+                        let outs = par::map_range(batch.len(), |k| {
+                            loss::batched_positive(tables, scorer, b, positives[batch[k]])
+                        });
+                        outs.into_iter()
+                            .map(|r| r.map(Some))
+                            .collect::<Result<Vec<_>>>()?
+                    }
+                    None => Vec::new(),
+                };
+                for (k, &i) in batch.iter().enumerate() {
                     let t = positives[i];
                     let data_loss = match config.loss {
                         LossKind::SelfAdversarial {
@@ -164,13 +254,26 @@ impl Trainer {
                             &mut sample_rng,
                             &mut grads,
                         )?,
-                        LossKind::OneVsAll => loss::one_vs_all_step(tables, scorer, t, &mut grads)?,
+                        LossKind::OneVsAll => match (batched.as_mut(), scored.get_mut(k)) {
+                            (Some(b), Some(slot)) => {
+                                let out = slot.take().ok_or_else(|| {
+                                    KgeError::Invalid("batched positive scored twice".into())
+                                })?;
+                                let l = out.loss;
+                                b.absorb(out, &mut grads);
+                                l
+                            }
+                            _ => loss::one_vs_all_step(tables, scorer, t, &mut grads)?,
+                        },
                     };
                     epoch_loss += data_loss as f64;
                     if config.n3_lambda > 0.0 {
                         epoch_n3 +=
                             apply_n3(tables, t, config.n3_lambda, &mut grads, &mut n3_buf)? as f64;
                     }
+                }
+                if let Some(b) = batched.as_mut() {
+                    b.flush(&mut grads);
                 }
                 if !grads.is_empty() {
                     opt.apply(tables, &grads)?;
@@ -477,5 +580,99 @@ mod tests {
             } if margin == 9.0
         ));
         assert!(matches!(c.optimizer, OptimKind::Adam { beta1, .. } if beta1 == 0.9));
+    }
+
+    #[test]
+    fn duplicate_weighting_repeats() {
+        use DuplicateWeighting::*;
+        assert_eq!(Ignore.repeats(50), 1);
+        assert_eq!(Count.repeats(0), 1);
+        assert_eq!(Count.repeats(7), 7);
+        assert_eq!(Count.repeats(5_000_000), MAX_FACT_REPEATS as usize);
+        assert_eq!(Log.repeats(1), 1);
+        assert_eq!(Log.repeats(3), 2); // 1 + floor(ln 3) = 2
+        assert_eq!(Log.repeats(100), 5); // 1 + floor(4.6)
+    }
+
+    #[test]
+    fn fit_with_ignore_equals_fit() {
+        let (store, ne, nr) = synthetic_kg();
+        let dims = 16;
+        let scorer = DistMult::new(dims);
+        let cfg = TrainConfig {
+            dims,
+            epochs: 3,
+            batch_size: 64,
+            lr: 0.3,
+            seed: 5,
+            ..TrainConfig::default()
+        };
+        let mut a = Tables::new(ne, nr, dims, 9);
+        let mut b = Tables::new(ne, nr, dims, 9);
+        let mut mult = HashMap::new();
+        mult.insert(store.triples()[0], 40u32);
+        Trainer::fit(&mut a, &scorer, &store, &cfg, |_| {}).unwrap();
+        Trainer::fit_with_multiplicity(
+            &mut b,
+            &scorer,
+            &store,
+            &mult,
+            DuplicateWeighting::Ignore,
+            &cfg,
+            |_| {},
+        )
+        .unwrap();
+        for e in 0..ne as u32 {
+            assert_eq!(
+                a.entity(e).unwrap(),
+                b.entity(e).unwrap(),
+                "Ignore must reproduce fit exactly"
+            );
+        }
+    }
+
+    #[test]
+    fn count_weighting_emphasises_a_frequent_fact() {
+        use crate::Scorer;
+        let (store, ne, nr) = synthetic_kg();
+        let dims = 16;
+        let scorer = DistMult::new(dims);
+        let cfg = TrainConfig {
+            dims,
+            epochs: 3,
+            batch_size: 64,
+            lr: 0.3,
+            seed: 5,
+            ..TrainConfig::default()
+        };
+        let hot = store.triples()[3];
+        let mut mult = HashMap::new();
+        mult.insert(hot, 30u32);
+        let score = |t: &Tables| {
+            scorer.score(
+                t.entity(hot.s).unwrap(),
+                t.relation(hot.r).unwrap(),
+                t.entity(hot.o).unwrap(),
+            )
+        };
+        let mut plain = Tables::new(ne, nr, dims, 9);
+        let mut weighted = Tables::new(ne, nr, dims, 9);
+        Trainer::fit(&mut plain, &scorer, &store, &cfg, |_| {}).unwrap();
+        Trainer::fit_with_multiplicity(
+            &mut weighted,
+            &scorer,
+            &store,
+            &mult,
+            DuplicateWeighting::Count,
+            &cfg,
+            |_| {},
+        )
+        .unwrap();
+        assert!(
+            score(&weighted) > score(&plain),
+            "a fact seen 30 times should score higher when counted: {} vs {}",
+            score(&weighted),
+            score(&plain)
+        );
     }
 }

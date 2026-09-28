@@ -169,6 +169,13 @@ impl Differentiable for HolE {
         let grad_o = self.plan.circular_convolution(r, s);
         (grad_s, grad_r, grad_o)
     }
+
+    /// HolE is bilinear in (s, o) and its half-spectrum index/query vectors
+    /// reproduce `score` exactly (module docs), so the batched 1-vs-all path
+    /// applies.
+    fn multilinear(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

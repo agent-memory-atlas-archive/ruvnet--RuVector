@@ -5372,7 +5372,7 @@ dependencies = [
  "ruvector-solver",
  "ruvector-sona 0.2.1",
  "ruvector-sparsifier",
- "ruvllm 2.3.0",
+ "ruvllm 2.4.0",
  "rvf-crypto",
  "rvf-federation",
  "rvf-runtime",
@@ -7433,7 +7433,7 @@ dependencies = [
  "ruvector-nervous-system",
  "ruvector-raft",
  "ruvector-sona 0.2.1",
- "ruvllm 2.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "ruvllm 2.3.0",
  "serde",
  "serde_json",
  "sqlx",
@@ -9664,7 +9664,7 @@ dependencies = [
 
 [[package]]
 name = "ruvector-embed-core"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "getrandom 0.4.3",
  "ort",
@@ -10028,7 +10028,7 @@ dependencies = [
  "ruvector-core 2.3.1",
  "ruvector-hailo",
  "ruvector-mmwave",
- "ruvllm 2.3.0",
+ "ruvllm 2.4.0",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -10097,8 +10097,9 @@ dependencies = [
 
 [[package]]
 name = "ruvector-kge"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
+ "rayon",
  "rustfft",
  "ruvector-router-core",
  "ruvector-typesafe-core",
@@ -10109,7 +10110,7 @@ dependencies = [
 
 [[package]]
 name = "ruvector-kge-ffi"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "napi",
  "napi-build",
@@ -10122,7 +10123,7 @@ dependencies = [
 
 [[package]]
 name = "ruvector-kge-wasm"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "js-sys",
  "ruvector-kge",
@@ -11073,17 +11074,17 @@ dependencies = [
 
 [[package]]
 name = "ruvector-typesafe-core"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
- "ruvector-router-core",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "ruvector-typesafe-ffi"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "napi",
  "napi-build",
@@ -11119,7 +11120,7 @@ dependencies = [
 
 [[package]]
 name = "ruvector-typesafe-wasm"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "js-sys",
  "ruvector-embed-core",
@@ -11374,6 +11375,39 @@ dependencies = [
 [[package]]
 name = "ruvllm"
 version = "2.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e18a016fcc2eb3bffbcb3c2bb1d4d7420df820e11ba92a7a9f45d5c6779d423b"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bincode 2.0.1",
+ "chrono",
+ "dashmap 6.2.1",
+ "dirs 5.0.1",
+ "futures-core",
+ "half",
+ "md5",
+ "ndarray 0.16.1",
+ "once_cell",
+ "parking_lot 0.12.5",
+ "rand 0.8.6",
+ "regex",
+ "ruvector-core 2.3.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "ruvector-sona 0.2.0",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "smallvec",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "ruvllm"
+version = "2.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11424,41 +11458,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "ruvllm"
-version = "2.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e18a016fcc2eb3bffbcb3c2bb1d4d7420df820e11ba92a7a9f45d5c6779d423b"
-dependencies = [
- "anyhow",
- "async-trait",
- "bincode 2.0.1",
- "chrono",
- "dashmap 6.2.1",
- "dirs 5.0.1",
- "futures-core",
- "half",
- "md5",
- "ndarray 0.16.1",
- "once_cell",
- "parking_lot 0.12.5",
- "rand 0.8.6",
- "regex",
- "ruvector-core 2.3.1 (registry+https://github.com/rust-lang/crates.io-index)",
- "ruvector-sona 0.2.0",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "smallvec",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "ruvllm-cli"
-version = "2.3.1"
+version = "2.4.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -11478,7 +11479,7 @@ dependencies = [
  "predicates",
  "prettytable-rs",
  "rustyline",
- "ruvllm 2.3.0",
+ "ruvllm 2.4.0",
  "serde",
  "serde_json",
  "tempfile",

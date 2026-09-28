@@ -56,6 +56,27 @@ function toNativeGenConfig(config?: GenerationConfig): NativeGenConfig | undefin
   };
 }
 
+const warned = new Set<string>();
+
+/** Warn once per process (or throw when `strict`). */
+function notice(code: string, message: string, strict: boolean | undefined): void {
+  if (strict) throw new Error(`${code}: ${message}`);
+  if (warned.has(code)) return;
+  warned.add(code);
+  const g = globalThis as unknown as {
+    process?: { emitWarning?: (m: string, o?: { code?: string }) => void };
+    console?: { warn?: (m: string) => void };
+  };
+  if (typeof g.process?.emitWarning === 'function') g.process.emitWarning(message, { code });
+  else g.console?.warn?.(`${code}: ${message}`);
+}
+
+const NO_LM_MESSAGE =
+  'the native RuvLLM engine has no language-model weights, so generate()/query() text is ' +
+  'not model output. For GGUF inference use the ruvllm CLI (`ruvllm serve <model> --strict`) ' +
+  'or another OpenAI-compatible server. Routing, memory and embeddings are unaffected. ' +
+  'Pass { strict: true } to throw instead.';
+
 /**
  * RuvLLM - Self-learning LLM orchestrator
  *
@@ -92,6 +113,17 @@ export class RuvLLM {
    */
   constructor(config?: RuvLLMConfig) {
     this.config = config ?? {};
+    const extra = this.config as Record<string, unknown>;
+    for (const key of ['modelPath', 'backend']) {
+      if (extra[key] !== undefined) {
+        notice(
+          'RUVLLM_UNSUPPORTED_OPTION',
+          `\`${key}\` is not supported by @ruvector/ruvllm and is ignored: this package does not ` +
+            'load model files. For GGUF inference use the ruvllm CLI (`ruvllm serve <model> --strict`).',
+          this.config.strict,
+        );
+      }
+    }
 
     const mod = getNativeModule();
     if (mod) {
@@ -108,6 +140,7 @@ export class RuvLLM {
    */
   query(text: string, config?: GenerationConfig): QueryResponse {
     if (this.native) {
+      notice('RUVLLM_NO_LANGUAGE_MODEL', NO_LM_MESSAGE, this.config.strict);
       const result = this.native.query(text, toNativeGenConfig(config));
       // napi-rs camelCases Rust field names on the way out, so the native
       // object carries `contextSize`/`latencyMs`/`requestId`. The snake_case
@@ -137,11 +170,14 @@ export class RuvLLM {
   /**
    * Generate text with SIMD-optimized inference
    *
-   * Note: If no trained model is loaded (demo mode), returns an informational
-   * message instead of garbled output.
+   * Note: the native engine has no language-model weights, so its text is
+   * not model output; the first call emits a `RUVLLM_NO_LANGUAGE_MODEL`
+   * warning (or throws with `strict: true`). Without the native module this
+   * returns an informational message.
    */
   generate(prompt: string, config?: GenerationConfig): string {
     if (this.native) {
+      notice('RUVLLM_NO_LANGUAGE_MODEL', NO_LM_MESSAGE, this.config.strict);
       return this.native.generate(prompt, toNativeGenConfig(config));
     }
 

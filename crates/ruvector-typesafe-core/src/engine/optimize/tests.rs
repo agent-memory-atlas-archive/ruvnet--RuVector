@@ -95,6 +95,7 @@ fn spec(base: EngineOptions, proposals: Vec<EngineOptions>) -> CampaignSpec {
         day_key: "d0".into(),
         created_seq_base: 0,
         created: None,
+        receipt_hash: crate::receipt::HashAlg::default(),
     }
 }
 
@@ -178,4 +179,22 @@ fn campaign_report_round_trips_through_json() {
     let back: CampaignReport = serde_json::from_str(&json).unwrap();
     assert_eq!(back.test_scorings, report.test_scorings);
     assert_eq!(back.champion_options, report.champion_options);
+}
+
+#[test]
+fn a_campaign_can_chain_its_receipts_with_sha256() {
+    use crate::receipt::{HashAlg, SHA256_PREFIX};
+    let engine = Engine::new(HashEmbedder::new(DIMS));
+    let mut s = spec(EngineOptions::default(), vec![EngineOptions::default()]);
+    s.receipt_hash = HashAlg::Sha256;
+    let report = engine.optimize(&s).unwrap();
+    assert!(!report.receipts.is_empty());
+    assert!(report
+        .receipts
+        .iter()
+        .all(|r| r.hash.starts_with(SHA256_PREFIX)));
+    assert!(report
+        .receipts
+        .verify_chain_requiring(HashAlg::Sha256)
+        .is_ok());
 }

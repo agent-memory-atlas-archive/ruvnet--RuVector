@@ -14,6 +14,7 @@ import { createHash } from 'node:crypto';
 import { buildQuestions } from './fixture.mjs';
 
 const sha256hex = (s) => createHash('sha256').update(String(s)).digest('hex');
+const numberOrNull = (x) => (typeof x === 'number' && Number.isFinite(x) ? x : null);
 
 /**
  * Normalised per-item scoring record. `choice`/`probabilities`/`confidence`
@@ -45,7 +46,8 @@ function record({ id, choice, probabilities, trueChoice, confidence, abstain, oo
 
 /**
  * Replay Jev's frozen per-item answers for the tickets `test` split.
- * @param jevBaseline parsed jev-baseline-2026-09-21.json
+ * @param jevBaseline parsed jev-baseline-2026-09-21.json (or any capture of the
+ *                    same shape, e.g. jev-live-2026-09-25.json with arm 'live')
  * @param testItems   the fixture items assigned to the `test` split
  * @param opts.arm    'baseline' (gen-0, apples-to-apples with our gen-0
  *                    criteria) or 'champion' (mutated criteria — informational).
@@ -77,13 +79,21 @@ export function replayJev(jevBaseline, testItems, { arm = 'baseline', limit } = 
         confidence: r.confidence,
         latencyMs: r.latencyMs,
         tokens: r.tokens,
-        // Jev exposes no noul/score probability, only its own correctness flags.
-        urgent: { pred: r.pred.urgent, label: r.label.urgent, correct: r.correct.urgent, score: null },
+        // Jev returns a continuous noul (urgent) and score (frustration). The
+        // 2026-09-21 capture kept only booleans/correctness, so `score` is
+        // null there; captures that keep `scores` (jev-live-2026-09-25.json)
+        // replay them so urgent AUROC can be reported for Jev too.
+        urgent: {
+          pred: r.pred.urgent,
+          label: r.label.urgent,
+          correct: r.correct.urgent,
+          score: numberOrNull(r.scores?.urgent),
+        },
         frustration: {
           pred: r.pred.frustration,
           label: r.label.frustration,
           correct: r.correct.frustration,
-          score: null,
+          score: numberOrNull(r.scores?.frustration),
         },
       }),
     );
