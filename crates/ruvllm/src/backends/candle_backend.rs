@@ -525,7 +525,62 @@ mod candle_impl {
 
             let tokenizer = HfTokenizer::from_file(path)
                 .map_err(|e| RuvLLMError::Storage(format!("Failed to load tokenizer: {}", e)))?;
+            self.install_tokenizer(tokenizer);
+            Ok(())
+        }
 
+        /// Build the tokenizer from the vocabulary embedded in a GGUF file
+        /// (`tokenizer.ggml.*`), when no `tokenizer.json` was loaded. Returns
+        /// whether one was installed; an unsupported tokenizer model is logged,
+        /// not fatal, so an explicit `load_tokenizer` afterwards still works.
+        fn load_embedded_tokenizer(&mut self, content: &gguf_file::Content) -> bool {
+            let md = &content.metadata;
+            let Some(model) = md
+                .get("tokenizer.ggml.model")
+                .and_then(|v| v.to_string().ok())
+                .cloned()
+            else {
+                return false;
+            };
+            let strings = |key: &str| -> Vec<String> {
+                md.get(key)
+                    .and_then(|v| v.to_vec().ok())
+                    .map(|vs| {
+                        vs.iter()
+                            .filter_map(|v| v.to_string().ok().cloned())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let tokens = strings("tokenizer.ggml.tokens");
+            let merges = strings("tokenizer.ggml.merges");
+            let types: Option<Vec<i32>> = md
+                .get("tokenizer.ggml.token_type")
+                .and_then(|v| v.to_vec().ok())
+                .map(|vs| vs.iter().filter_map(|v| v.to_i32().ok()).collect());
+            match crate::backends::gguf_tokenizer::from_gguf_parts(
+                &model,
+                &tokens,
+                &merges,
+                types.as_deref(),
+            ) {
+                Ok(tokenizer) => {
+                    tracing::info!(
+                        "Built the '{}' tokenizer embedded in the GGUF ({} tokens)",
+                        model,
+                        tokens.len()
+                    );
+                    self.install_tokenizer(tokenizer);
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!("{}", e);
+                    false
+                }
+            }
+        }
+
+        fn install_tokenizer(&mut self, tokenizer: HfTokenizer) {
             // Detect special tokens
             let special_tokens = SpecialTokens {
                 bos_token_id: tokenizer
@@ -556,8 +611,6 @@ mod candle_impl {
                 inner: tokenizer,
                 special_tokens,
             });
-
-            Ok(())
         }
 
         /// Load GGUF quantized model
@@ -593,6 +646,12 @@ mod candle_impl {
                      (e.g. 'qwen2.attention.head_count') that qlama cannot read.",
                     gguf_arch
                 )));
+            }
+
+            // A bare .gguf carries its vocabulary; use it when no tokenizer.json
+            // was found next to the file (load_model tries that first).
+            if self.tokenizer.is_none() {
+                self.load_embedded_tokenizer(&gguf_content);
             }
 
             // Extract config from GGUF metadata
